@@ -1,0 +1,33 @@
+name: "gfap-tauopathy"
+title: "GFAP Tauopathy"
+description: |
+  A Novel Protective Role of Astrocytic GFAP in Tau Proteostasis
+theme: theme.css
+favicon: images/favicon.ico
+base_url: https://serranopozolab.org/gfap-tauopathy
+repository_url: https://github.com/serrano-pozo-lab/gfap-tauopathy
+output_dir: "docs"
+navbar:
+  search: false
+  source_url: https://github.com/serrano-pozo-lab/gfap-tauopathy
+  right:
+    - text: "Home"
+      href: index.html
+    - text: "Differential Expression"
+      href: de-analysis-viz
+    - text: "WGCNA"
+      menu:
+        - text: "WGCNA Analysis"
+          href: wgcna
+        - text: "Plot Heatmaps"
+          href: wgcna-heatmaps
+    - text: "Mass Spectrometry"
+      menu:
+        - text: "Human Analysis"
+          href: mass-spec-human
+        - text: "Mouse Analysis"
+          href: mass-spec-mouse
+        - text: "---"
+        - text: "Plot Venn Diagram"
+          href: mass-spec-venn
+output: distill::distill_article

@@ -1,0 +1,1299 @@
+---
+title: "Differential Expression and Pathway Enrichment Visualization"
+description: |
+  This R script performs differential expression analysis of RNA-seq data, generates visualizations such as boxplots, volcano plots, and heatmaps, and conducts pathway enrichment analysis using GO, Reactome, and GSEA. It also visualizes enrichment results and WGCNA module-trait relationships.
+author:
+  - first_name: "Ayush"
+    last_name: "Noori"
+    url: https://www.github.com/ayushnoori
+    affiliation: Massachusetts General Hospital
+    affiliation_url: https://www.serranopozolab.org
+    orcid_id: 0000-0003-1420-1236
+output:
+  distill::distill_article:
+    toc: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+# Dependencies
+
+Load requisite packages and define directories. Note that this script may also use my personal utilities package `brainstorm`, which can be downloaded via `devtools::install_github("ayushnoori/brainstorm")`.
+
+```{r load-packages, message=FALSE, warning=FALSE}
+# data manipulation
+library(data.table)
+library(purrr)
+library(magrittr)
+
+# relative file paths
+library(here)
+
+# load expression analysis packages
+library(edgeR)
+library(limma)
+
+# load mouse annotations
+library(org.Mm.eg.db)
+
+# data visualization
+library(ggplot2)
+library(EnhancedVolcano)
+library(pheatmap)
+
+# HTML construction
+library(htmltools)
+
+# utilities package
+library(openxlsx)
+library(brainstorm)
+```
+
+Note that directories are relative to the R project path.
+
+```{r define-directores}
+# set directories
+TPM_dir = here("Data", "RNA_seq", "counts_TPM")
+sex_adj_dir = here("Data", "RNA_seq", "sex_adjusted")
+results_dir = here("Results", "RNA_seq")
+```
+
+# Read Raw Counts
+
+Read raw counts and construct expression list object.
+
+```{r read-TPM}
+# read TPM
+# TPM = fread(here(TPM_dir, "counts_tpm_filtered_low_expressed_genes.csv"))
+
+# read counts
+counts = fread(here(TPM_dir, "gene_rawcounts.csv"))
+
+# filter out low-expressed genes
+# remove genes with raw counts less than 1 in more than 3 samples
+# keep = rowSums(counts < 1) <= 3
+
+# filter out transcripts and get genes
+counts = counts[!grepl("ENSMUST", Name), ]
+genes = counts$Name
+counts = counts[, Name := NULL] %>%
+  as.data.frame()
+rownames(counts) = genes
+
+# # map genes to IDs
+# genes_str = gsub("\\.\\d+$", "", genes)
+# gene_annot = select(org.Mm.eg.db, genes_str, c("SYMBOL", "GENENAME", "GENETYPE", "ENTREZID"), "ENSEMBL") %>%
+#   as.data.table() %>%
+#   .[!duplicated(ENSEMBL), ]
+
+# read annotations
+mouse_annot = fread(here(TPM_dir, "GRCm39_mouse_genes.csv"))
+colnames(mouse_annot) = c("GeneID", "GeneIDVersion", "EntrezID", "Name", "Type", "Description", "Start", "End", "Symbol")
+genes_str = gsub("\\.\\d+$", "", rownames(counts)) %>% data.table(GeneID = .)
+genes_annot = merge(genes_str, mouse_annot, by = "GeneID", all.x = T, all.y = F, sort = F) %>%
+  .[!duplicated(GeneID)] %>%
+  .[, Symbol := NULL]
+
+# adjust rownames
+# all(genes_str$GeneID == genes_annot$GeneID)
+# sum(duplicated(genes_str$GeneID))
+rownames(counts) = genes_str$GeneID
+
+# read sample list
+sample_list = fread(here(TPM_dir, "GFAPoverexpression_RNA-seq_samples_list.csv"))[1:40]
+
+# create sample matrix
+samples = data.table(File = colnames(counts))
+sample_split = map(samples, ~strsplit(.x, "_"))[[1]] %>%
+  lapply(function(x) as.list(x[4])) %>%
+  data.table::rbindlist()
+
+# bind to samples
+samples = cbind(samples, sample_split)
+setnames(samples, c("V1"), c("Sample"))
+
+# remove non-transgenic sample
+counts = counts[, -which(samples$Sample == "NTG")]
+samples = samples[!Sample == "NTG"]
+colnames(counts) = samples$Sample
+
+# add additional columns
+samples = merge(samples, sample_list, by = "Sample", sort = F) %>%
+  .[, Number := map2(Treatment, Sample, ~gsub(.x, "", .y))] %>%
+  .[, Number := as.numeric(Number)] %>%
+  .[, Treatment := factor(Treatment, levels = c("PBS", "GFP", "WT", "R239H"))] %>%
+  .[, Sex := factor(Sex, levels = c("M", "F"))]
+
+# reorder samples
+counts = counts[, order(samples$Treatment, samples$Number)]
+samples = samples[order(Treatment, Number)]
+
+# create expression list object
+dge = DGEList(counts = counts, samples = samples, group = samples$Treatment, genes = genes_annot)
+```
+
+# Normalize Data
+
+Normalize data following [this tutorial](https://www.reneshbedre.com/blog/edger-tutorial.html).
+
+The normalization factors are an indicator of the status of gene expression. If the normalization factor is < 1 for some samples, it indicates a small number of high count genes are abundant in that sample and vice versa. The product of all normalization factors is equal to 1.
+
+Note that `calcNormFactors` doesn't normalize the data; rather, it just calculates normalization factors for use downstream.
+
+```{r norm-data}
+# make design matrix
+design = model.matrix(~0 + Treatment + Sex, data = samples)
+colnames(design) = gsub("(Treatment)|(Sex)", "", colnames(design))
+
+# filter out low-expressed genes
+keep = filterByExpr(y = dge, min.count = 5)
+message("Removing ", sum(!keep), " low-expressed genes, ", sum(keep), " genes remain.")
+dge = dge[keep, , keep.lib.sizes=FALSE]
+
+# calculate normalization factors
+dge = calcNormFactors(object = dge)
+
+# transform counts to logCPM values
+# check concordance with v$E
+# logCPM = cpm(dge, log = TRUE, prior.count = 3)
+
+# transform counts to logCPM values
+v = voom(dge, design, plot = TRUE)
+
+# save results to file
+saveRDS(dge, file = here(results_dir, "RNAseq_DGE.RDS"))
+saveRDS(v, file = here(results_dir, "RNAseq_voom.RDS"))
+```
+
+# Plot Expression Values
+
+```{r plot-expr}
+# get expression matrix
+box_mtx = v$E %>%
+  as.data.table() %>%
+  .[, Gene := v$genes$Name] %>%
+  .[, GeneID := rownames(v$E)]
+setcolorder(box_mtx, c("Gene", "GeneID"))
+box_mtx = melt(box_mtx, id.vars = c("Gene", "GeneID"),
+               variable.name = "Sample", value.name = "Expression") %>%
+  merge(samples, ., all.x = F, all.y = T) %>%
+  .[, Sample := factor(Sample, labels = samples$Sample, levels = samples$Sample)]
+
+# create boxplot
+box = ggplot(box_mtx, aes(x = Sample, y = Expression, fill = Treatment)) + #  linetype = Sex
+  geom_boxplot(outlier.alpha = 0.1, na.rm = TRUE) + 
+  scale_fill_manual(values =  c("#F5F8F8", "#BFD0D5", "#688F9C", "#285E72")) +
+  # scale_linetype_manual(values = c("solid", "dashed")) + 
+  labs(x = "Samples", y = "Normalized Expression", fill = "Treatment") + # linetype = "Sex"
+  theme(axis.title.x = element_text(size=12, face="bold"),
+        axis.title.y = element_text(size=12, face="bold"),
+        legend.title = element_text(size=10, face="bold"))
+
+```
+
+
+# Differential Expression Analysis
+
+Perform differential expression analysis following Ch. 15 [here](https://www.bioconductor.org/packages/devel/bioc/vignettes/limma/inst/doc/usersguide.pdf).
+
+```{r get-degs}
+# fit linear model for each gene
+fit = lmFit(v, design)
+
+# get contrasts
+contrasts = makeContrasts(
+  GFP_vs_PBS = GFP - PBS,
+  WT_vs_PBS = WT - PBS,
+  R239H_vs_PBS = R239H - PBS,
+  WT_vs_GFP = WT - GFP,
+  R239H_vs_GFP = R239H - GFP,
+  R239H_vs_WT = R239H - WT,
+  levels = design
+)
+
+# compute contrasts from fit
+contrast_names = colnames(contrasts)
+names(contrast_names) = contrast_names
+cont_fit = contrasts.fit(fit, contrasts)
+
+# compute empirical Bayes statistics
+e_fit = eBayes(cont_fit)
+
+# get DEGs
+diff_expr = imap(contrast_names, ~topTable(e_fit, coef = .x, number = nrow(v)))
+```
+
+# Visualize Results
+
+Create plots and save DEGs.
+
+```{r save-degs}
+# color scheme for contrasts
+contrast_colors = c("#FAE1DD", "#FCD5CE", "#FEC5BB", "#E8E8E4", "#D8E2DC", "#C1D8EC")
+names(contrast_colors) = contrast_names
+
+# function to save DEGs
+save_DEGs = function(deg_table, contrast_name, wb) {
+  
+  # for example:
+  # deg_table = deg_table = diff_expr$R239H_vs_PBS
+  # contrast_name = "R239H_vs_PBS"
+  # wb = createWorkbook()
+  
+  # save DEG table
+  deg_table = deg_table %>%
+    as.data.table() %>%
+    .[order(P.Value, abs(logFC))]
+  
+  # save DEG table
+  fwrite(deg_table, here(results_dir, paste0(contrast_name, "_DEGs.csv")))
+  
+  # add worksheet
+  sheet_name = gsub("_vs_", " vs. ", contrast_name)
+  add_worksheet(wb, sheet = sheet_name, table = deg_table, fc = TRUE, tab = contrast_colors[contrast_name])
+  
+  # add conditional formatting
+  conditionalFormatting(wb, sheet = sheet_name, cols = 9, rows = 1:nrow(deg_table) + 1, type = "colourScale", style = c("#D9A3A3", "#FFFFFF", "#8DAE93"))
+  
+  # get bounding limit
+  x_bound = max(-min(deg_table[, logFC]), max(deg_table[, logFC]))
+  
+  # create volcano plot
+  p = EnhancedVolcano(deg_table, lab = deg_table$Name, x = "logFC", y = "P.Value",
+                      xlim = c(-x_bound - 0.1, x_bound + 0.1),
+                      ylim = c(0, max(-log10(deg_table[, "P.Value"]), na.rm=TRUE)),
+                      title = sheet_name,
+                      subtitle = "p-value Threshold = 0.05, FC Threshold = 2",
+                      # labSize = 2,
+                      caption = NULL, pCutoff = 0.05, FCcutoff = log2(2))
+  
+  # save volcano plot
+  ggsave(here(results_dir, paste0(contrast_name, "_volcano_plot.pdf")), p, width = 12, height = 8)
+  
+}
+
+
+# create workbook
+wb = createWorkbook()
+
+# map function over DEG results
+iwalk(diff_expr, ~save_DEGs(.x, .y, wb))
+
+# save workbook
+openxlsx::saveWorkbook(wb, file = here(results_dir, "GFAP Overexpression DEGs.xlsx"), overwrite = TRUE)
+```
+
+# Heatmap Function
+
+```{r heatmap}
+# get expression matrix
+expr_mtx = v$E %>%
+  as.data.table() %>%
+  .[, Gene := v$genes$Name]
+setcolorder(expr_mtx, c("Gene"))
+
+# function to plot heatmap
+# note, for WGCNA genes, change save_folder to "WGCNA"
+plot_heatmap = function(subset_genes, file_name, width_val = 14, height_val = 4, cutree_rows = NA, cluster_rows = TRUE, order_ave_expr = F, use_module_membership = F, module_membership_table = NA, save_folder = "GSEA") {
+  
+  # make subset unique
+  subset_genes = unique(subset_genes)
+  
+  # subset by genes of interest
+  subset_mtx = expr_mtx[Gene %in% subset_genes] %>%
+    .[!duplicated(Gene)]
+  
+  # get significance values for subset of genes
+  subset_sig = imap(diff_expr, ~{
+    as.data.table(.x) %>%
+      .[Name %in% subset_genes] %>%
+      .[!duplicated(Name), ] %>%
+      .[, get(".y") := P.Value] %>%
+      .[, .SD, .SDcols = c("Name", .y)]
+  })
+  subset_sig =  Reduce(function(...) merge.data.table(..., by = "Name", all = TRUE), subset_sig)
+  
+  # convert data to data frame
+  setDF(subset_mtx)
+  rownames(subset_mtx) = subset_mtx$Gene
+  subset_mtx = subset_mtx[-1]
+  
+  # convert annotations to data frame
+  subset_sig = subset_sig[!duplicated(Name), ]
+  setDF(subset_sig)
+  rownames(subset_sig) = subset_sig$Name
+  subset_sig = subset_sig[-1]
+  colnames(subset_sig) = gsub("_vs_", " vs. ", colnames(subset_sig))
+  
+  # convert to binary label
+  sig_vals = subset_sig < 0.05
+  ns_vals = subset_sig >= 0.05
+  subset_sig[sig_vals] = "P < 0.05"
+  subset_sig[ns_vals] = "N.S."
+  
+  # scale data
+  scale_data = function(b) { return(100*(b - min(b))/(max(b) - min(b))) }
+  subset_mtx = apply(subset_mtx, 1, scale_data) %>% t()
+  
+  # make column annotations
+  col_annos = v$targets %>%
+    .[, c("Treatment", "Sex")]
+  
+  # reorder columns
+  subset_mtx = subset_mtx[, order(col_annos$Treatment, col_annos$Sex)]
+  col_annos = col_annos[order(col_annos$Treatment, col_annos$Sex), ]
+  col_annos$Sex = factor(col_annos$Sex, levels = c("M", "F"), labels = c("Male", "Female"))
+  col_gaps = cumsum(summary(col_annos$Treatment))
+  
+  # create palette
+  # hm_palette = colorRampPalette(c("#4575B4", "#4575B4", "#4575B4", "#91BFDB", "#E0F3F8", "#FFFFBF", "#FEE090", "#FC8D59", "#D73027", "#D73027", "#D73027"))(100)
+  hm_palette = ggsci::pal_gsea()(12)
+  hm_palette = colorRampPalette(hm_palette)(100)
+  
+  # define heatmap color palette for columns
+  anno_colors = list(
+    # Sex = c(Male = "black", Female = "white"), 
+    Sex = c(Male = "#377EB8", Female = "#ce7b91"), 
+    # Treatment = c(PBS = "#999999", GFP = "#6c9a8b", WT = "#ce7b91", R239H = "#7d1538")
+    Treatment = c(PBS = "#F5F8F8", GFP = "#BFD0D5", WT = "#688F9C", R239H = "#285E72")
+  )
+  
+  # define heatmap color palette for rows (significance)
+  sig_colors = map(colnames(subset_sig), ~c(`P < 0.05` = "#08A045", `N.S.` = "#E6E6EA"))
+  names(sig_colors) = colnames(subset_sig)
+  anno_colors = append(anno_colors, sig_colors)
+  
+  # if directed to use module membership 
+  if(use_module_membership) {
+    
+    # sort by module membership
+    sorted_subset_mtx = subset_mtx[module_membership_table$Gene, ]
+    
+    # make heatmap accounting for module membership
+    p = pheatmap::pheatmap(sorted_subset_mtx, color = hm_palette, border_color = "black",
+                 breaks = seq(0, 100, length.out = length(hm_palette) + 1), 
+                 cluster_rows = F, cluster_cols = F, gaps_col = col_gaps,
+                 cutree_rows = cutree_rows, annotation_row = subset_sig,
+                 annotation_col = col_annos, annotation_colors = anno_colors,
+                 show_rownames = T, show_colnames = F, silent = T)
+  
+  # if directed to order by average expression
+  } else if (order_ave_expr) {
+    
+    # sort by average expression
+    ave_expr = apply(subset_mtx, 1, mean)
+    sorted_subset_mtx = subset_mtx[order(-ave_expr), ]
+    
+    # make heatmap sorting by average expression
+    p = pheatmap::pheatmap(sorted_subset_mtx, color = hm_palette, border_color = "black",
+                 breaks = seq(0, 100, length.out = length(hm_palette) + 1), 
+                 cluster_rows = F, cluster_cols = F, gaps_col = col_gaps,
+                 cutree_rows = cutree_rows, # annotation_row = subset_sig,
+                 annotation_colors = anno_colors, annotation_col = col_annos, 
+                 show_rownames = T, show_colnames = F, silent = T)
+    
+  # if module membership (for WGCNA) not provided
+  } else {
+    
+    # make heatmap
+    p = pheatmap::pheatmap(subset_mtx, color = hm_palette, border_color = "black",
+                 breaks = seq(0, 100, length.out = length(hm_palette) + 1), 
+                 cluster_rows = cluster_rows, cluster_cols = F, gaps_col = col_gaps,
+                 cutree_rows = cutree_rows, annotation_row = subset_sig,
+                 annotation_col = col_annos, annotation_colors = anno_colors,
+                 show_rownames = T, show_colnames = F, silent = T)
+    
+  }
+  
+  # save plot
+  ggsave(here("Results", save_folder, "heatmaps", file_name), p, width = width_val, height = height_val, limitsize = F)
+  
+  # return heatmap
+  return(p)
+  
+}
+
+# plot leading edge heatmap
+leading_edge_genes = c("Klk8", "Klf4", "Scarf1", "Cntf", "Mdm2", "Sfn", "Nxn", "Txndc2", "Pdia5", "Ifi30", "Gsto2")
+# plot_heatmap(leading_edge_genes, "leading_edge_genes.pdf")
+
+# WT vs. GFP genes
+WT_vs_GFP_genes = diff_expr$WT_vs_GFP %>% 
+  as.data.table() %>%
+  .[P.Value < 0.05] %>%
+  .[Type == "protein_coding", Name]
+# plot_heatmap(WT_vs_GFP_genes, "WT_vs_GFP_genes.pdf", height = 50, cutree_rows = 5)
+
+# protein coding genes
+pc_genes = v$genes %>%
+  as.data.table() %>%
+  .[Type == "protein_coding", Name] %>%
+  unique()
+# plot_heatmap(pc_genes, "all_protein_coding_genes.pdf", height = 1800, cutree_rows = 500)
+
+# GFP / WT / R239H
+GFP_WT_R239H_genes = rbind(diff_expr$WT_vs_GFP, diff_expr$R239H_vs_GFP, diff_expr$R239H_vs_WT)  %>% 
+  as.data.table() %>%
+  .[P.Value < 0.05] %>%
+  .[Type == "protein_coding", Name] %>%
+  unique()
+
+# get genes differentially expressed in GFP vs. PBS
+GFP_vs_PBS_genes = diff_expr$GFP_vs_PBS %>% 
+  as.data.table() %>%
+  .[P.Value < 0.05] %>%
+  .[Type == "protein_coding", Name]
+
+# exclude genes differentially expressed in GFP vs. PBS from GFP / WT / R239H
+GFP_WT_R239H_genes = GFP_WT_R239H_genes[!(GFP_WT_R239H_genes %in% GFP_vs_PBS_genes)]
+# plot_heatmap(GFP_WT_R239H_genes, "EGFP_WT_R239H_genes.pdf", height = 200, cutree_rows = 20)
+
+# GFP vs. PBS genes
+GFP_vs_PBS_genes = diff_expr$GFP_vs_PBS %>% 
+  as.data.table() %>%
+  .[P.Value < 0.05] %>%
+  .[Type == "protein_coding", Name]
+# plot_heatmap(GFP_vs_PBS_genes, "GFP_vs_PBS_genes.pdf", height = 150, cutree_rows = 5)
+
+# read astrocyte gene sets
+# 168 out of the 196 map without conversion
+astro_gene_sets = fread(here("Data", "gene_sets", "astrocyte_gene_sets.csv"))
+ADRA_genes = astro_gene_sets$`Serrano-Pozo_ADRA` %>%
+  .[!(. == "")] %>%
+  stringr::str_to_title() %>%
+  .[. %in% diff_expr$GFP_vs_PBS$Name]
+# plot_heatmap(ADRA_genes, "ADRA_genes.pdf", height = 30, cutree_rows = 10)
+```
+
+
+# WGCNA Heatmap with Stata Analysis
+
+```{r wgcna-heatmap-stata}
+# plot heatmap
+library(ComplexHeatmap)
+# library(ggheatmap)
+library(RColorBrewer)
+library(stringr)
+
+# read WGCNA results
+WGCNA_dir = here("Results", "WGCNA")
+stata_df = fread(file.path(WGCNA_dir, "Module_eigengenes_sex_gfap_STATA.csv"))
+
+# order stata_df by GFAP
+stata_df = stata_df[order(-`gfap beta`)]
+
+# make heatmap dataframe
+new_names = c("GFAP", "Sex", "Interaction")
+heatmap_df = stata_df[, c("gfap beta", "sex beta", "sex_gfap_beta")] %>%
+  as.data.frame()
+colnames(heatmap_df) = new_names
+rownames(heatmap_df) = gsub("ME", "", stata_df$V1)
+setcolorder(heatmap_df, c("GFAP", "Sex", "Interaction"))
+
+# create annotation data frame
+round_val = function(x) sprintf("%.3f", round(x, 3))
+
+# subset data frame
+annot_df = copy(stata_df) %>%
+  .[, GFAP := paste0(round_val(`gfap beta`), "\np = ", round_val(`gfap pvalue`))] %>%
+  .[, Sex := paste0(round_val(`sex beta`), "\np = ", round_val(`sex pvalue`))] %>%
+  .[, Interaction := paste0(round_val(`sex_gfap_beta`), "\np = ", round_val(`sex_gfap_pvalue`))] %>%
+  # .[, GFAP := expression(paste(round_val(`gfap beta`), "\nitalic(p) == ", round_val(`gfap pvalue`)))] %>%
+  # .[, Sex := expression(paste(round_val(`sex beta`), "\nitalic(p) == ", round_val(`sex pvalue`)))] %>%
+  # .[, Interaction := expression(paste(round_val(`sex_gfap_beta`), "\nitalic(p) == ", round_val(`sex_gfap_pvalue`)))] %>%
+  setnames("V1", "module") %>%
+  .[, .SD, .SDcols = c("module", new_names)] %>%
+  .[, module := gsub("ME", "", module)] %>%
+  .[, row_index := seq(1, nrow(.))]
+
+# make long
+annot_df = melt(annot_df, id.vars = c("module", "row_index"), measure.vars = new_names, variable.name = "cluster", value.name = "label") %>%
+  .[, fold_change := as.numeric(gsub("\np", "", word(label, 1), fixed = T))] %>%
+  .[, text_color := ifelse(abs(fold_change) > 0.5, "white", "black")] %>%
+  .[, column_index := as.integer(factor(cluster, levels = new_names))]
+  # as.data.frame()
+# setcolorder(annot_df, c("GFAP", "Sex", "Interaction"))
+
+# module names and colors
+module_names = rownames(heatmap_df)
+names(module_names) = module_names
+module_names = list(Modules = module_names)
+
+# row clustering
+cluster_rows = FALSE # FALSE
+
+p = Heatmap(as.matrix(heatmap_df),
+            col = rev(colorRampPalette(brewer.pal(n = 11, name = "RdBu")[2:10])(100)),
+            border = TRUE, border_gp = gpar(col = "black", lwd = 1),
+            rect_gp = gpar(col = "black", lwd = 0.5),
+            row_names_side = "left",
+            cluster_rows = cluster_rows, row_dend_side = "right",
+            # cluster_rows = FALSE,
+            cluster_columns = FALSE,
+            column_names_gp = gpar(fontsize = 14, fontface = "bold"),
+            column_names_rot = 0, column_names_centered = TRUE,
+            heatmap_legend_param = list(title = "Beta", legend_height = unit(2, "in"),
+                                        at = seq(-1, 1, 0.5)),
+            
+            left_annotation = rowAnnotation(name = "module", Modules = rownames(heatmap_df), col = module_names, show_legend = FALSE, show_annotation_name = FALSE),
+            
+            cell_fun = function(j, i, x, y, w, h, col) { # add text to each grid
+              grid.text(annot_df[get("row_index") == i & get("column_index") == j, get("label")], x, y,
+                        gp = gpar(fontsize = 5, col = annot_df[get("row_index") == i & get("column_index") == j, get("text_color")]))
+            },
+            )
+
+if(cluster_rows) {
+  
+  # save to file
+  pdf(file = here(WGCNA_dir, "Module-Trait Regression Heatmap Clustered.pdf"), width = 8, height = 10)
+  draw(p)
+  dev.off()
+  
+  
+} else {
+  
+  # save to file
+  pdf(file = here(WGCNA_dir, "Module-Trait Regression Heatmap.pdf"), width = 8, height = 10)
+  draw(p)
+  dev.off()
+  
+}
+  
+
+# # make long
+# annot_df = melt(annot_df, id.vars = "V1", measure.vars = new_names, variable.name = "cluster", value.name = "Label") %>%
+#   setnames("V1", "gene") %>%
+#   .[, gene := gsub("ME", "", gene)] %>%
+#   .[, fold_change := as.numeric(gsub("\np", "", word(Label, 1), fixed = T))] %>%
+#   .[, text_color := ifelse(abs(fold_change) > 0.5, "white", "black")] # %>%
+#   # as.data.frame()
+# # setcolorder(annot_df, c("GFAP", "Sex", "Interaction"))
+
+# # make heatmap
+# p = ggheatmap(
+#   heatmap_df,
+#   color = colorRampPalette(brewer.pal(n = 11, name = "RdBu"))(100),
+#   border = "black",
+#   annotation_color = rownames(heatmap_df)
+# ) + 
+#   geom_text(data = annot_df, aes(x = cluster, y = gene, label = Label, color = text_color), inherit.aes = FALSE, size = 2) +
+#   scale_color_manual(values = c("black", "white"), guide = "none") +
+#   labs(fill = "Beta")
+
+# save to file
+# ggsave(here(WGCNA_dir, "Module-Trait Regression Heatmap.pdf"), p, width = 8, height = 10)
+
+```
+
+# WGCNA Heatmap
+
+Make heatmaps of WGCNA genes based on module-trait correlations. See relevant paper [here](https://doi.org/10.1016/j.neuron.2020.02.034).
+
+```{r wgcna-heatmap}
+# read WGCNA results
+WGCNA_dir = here("Results", "WGCNA")
+finalOutput = fread(file.path(WGCNA_dir, "WGCNA Results.csv"))
+geneModuleMembership = fread(file.path(WGCNA_dir, "Gene Module Membership.csv"))
+# significant_modules = readRDS(file.path(WGCNA_dir, "Significant Module Names.RDS"))
+significant_modules = stata_df[(`gfap pvalue` < 0.05) | (`sex pvalue` < 0.05) | (`sex_gfap_pvalue` < 0.05), V1]
+
+# get size of modules
+module_sizes = finalOutput[, .N, by = c("Labels", "Colors")]
+
+# # plot dark slate blue genes
+# darkslateblue_genes = finalOutput[Colors == "darkslateblue", Gene]
+# plot_heatmap(darkslateblue_genes, "darkslateblue.pdf", height = 15, save_folder = "WGCNA", cutree_rows = 2)
+
+# plot genes for modules of interest
+# module_list = c("thistle1", "lightblue4", "lightgreen", "firebrick3", "antiquewhite2", "paleturquoise", "salmon")
+module_list = gsub("ME", "", significant_modules)
+
+
+# define number of clusters per module
+cutree_rows_seq = rep(NA, length(module_list))
+names(cutree_rows_seq) = module_list
+cutree_rows_seq["firebrick3"] = 5
+cutree_rows_seq["antiquewhite2"] = 5
+
+# iterate over modules
+for (module_name in module_list) {
+  
+  # get module size and genes
+  message("Plotting ", module_name, "...")
+  module_size = module_sizes[Colors == module_name, N]
+  module_genes = finalOutput %>%
+    .[Gene != ""] %>%
+    .[Colors == module_name, Gene]
+  
+  # get module membership score
+  module_membership = geneModuleMembership %>%
+    .[Gene %in% module_genes, .SD, .SDcols = c("Gene", module_name)] %>%
+    .[order(-get(module_name)), ]
+  
+  # plot heatmap
+  plot_heatmap(module_genes, paste0(module_name, ".pdf"), # cutree_rows = cutree_rows_seq[module_name],
+               order_ave_expr = T,
+               # use_module_membership = T, module_membership = module_membership,
+               height = module_size/6, save_folder = "WGCNA")
+  
+}
+```
+
+Perform pathway enrichment analysis.
+
+```{r go-enrichment}
+# library(fgsea)
+# https://bioconductor.org/packages/release/bioc/vignettes/fgsea/inst/doc/fgsea-tutorial.html
+
+library(anRichment)
+library(stringr)
+# https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/GeneAnnotation/Tutorials/index.html
+# https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/GeneAnnotation/Tutorials/anRichment-Tutorial1.pdf
+GOcollection = buildGOcollection(organism = "mouse")
+
+# perform enrichment analysis
+GOenrichment = enrichmentAnalysis(
+  classLabels = finalOutput$Colors, identifiers = finalOutput$EntrezID,
+  refCollection = GOcollection,
+  useBackground = "given",
+  threshold = 1, thresholdType = "Bonferroni",
+  maxReportedOverlapGenes = 10000,
+  getOverlapEntrez = TRUE, getOverlapSymbols = TRUE,
+  ignoreLabels = "grey")
+collectGarbage()
+
+# save RDS output
+saveRDS(GOenrichment, file = here("Results", "WGCNA", "pathway_enrichment", "GO_enrichment.RDS"))
+
+# load RDS output
+GOenrichment = readRDS(file = here("Results", "WGCNA", "pathway_enrichment", "GO_enrichment.RDS"))
+
+# extract gene names
+extract_names = function(input_list, index) {
+  
+  # split by pipe character and extract
+  gene_entries = unlist(strsplit(input_list, "\\|"))
+  split_values = stringr::str_extract_all(gene_entries, "\\d+|\\(.+?\\)")
+  
+  # get numbers or gene names
+  extracted_values = map_chr(split_values, ~.[index])
+  
+  # if gene names, remove parentheses
+  collapse_list = paste(extracted_values, collapse = ", ")
+  collapse_list = gsub("(", "", collapse_list, fixed = T)
+  collapse_list = gsub(")", "", collapse_list, fixed = T)
+  
+  # return collapsed list
+  return(collapse_list)
+  
+}
+
+# function to extract the middle value from a string
+extract_db = function(input_string) {
+  components = unlist(strsplit(input_string, "\\|"))
+  db = gsub(".", ": ", components[2], fixed = T)
+  return(db)
+}
+
+# get results table
+enrichment_results = GOenrichment$enrichmentTable %>%
+  as.data.table() %>%
+  .[, inGroups := map_chr(inGroups, extract_db)] %>%
+  .[, GeneName := map_chr(overlapGenes, ~extract_names(.x, 2))] %>%
+  .[, EntrezID := map_chr(overlapGenes, ~extract_names(.x, 1))] %>%
+  .[, overlapGenes := NULL] %>%
+  .[, shortDataSetName := NULL] %>%
+  setnames(old = c("class", "rank", "dataSetID", "dataSetName", "inGroups", "pValue", "Bonferroni", "FDR", "nCommonGenes", "fracOfEffectiveClassSize", "expectedFracOfEffectiveClassSize", "enrichmentRatio", "classSize", "effectiveClassSize", "fracOfEffectiveSetSize", "effectiveSetSize", "GeneName", "EntrezID"),
+           new = c("Module", "Rank", "PathwayID", "Pathway", "Database", "pValue", "Bonferroni", "FDR", "nCommonGenes", "fracOfEffectiveClassSize", "expectedFracOfEffectiveClassSize", "enrichmentRatio", "classSize", "effectiveClassSize", "fracOfEffectiveSetSize", "effectiveSetSize", "GeneName", "EntrezID"))
+
+# write excel file
+wb = createWorkbook()
+sname = "Enrichment Results"
+brainstorm::add_worksheet(wb, sheet = "Enrichment Results", table = enrichment_results)
+setColWidths(wb, sname, cols = 1:18, widths = "auto")
+setColWidths(wb, sname, cols = 4, widths = 60)
+freezePane(wb, sname, firstRow = TRUE, firstCol = TRUE)
+  
+even_idx = as.integer(as.factor(enrichment_results$Module)) %% 2 == 0
+even_idx[is.na(even_idx)] = FALSE
+addStyle(wb, sname, createStyle(fontColour = "#363635", fgFill = "#FFFFFF", fontName = "Arial", fontSize = 10, border = "TopBottomLeftRight", borderStyle = "thin"), rows = which(even_idx) + 1, cols = 1:18, gridExpand = T)
+addStyle(wb, sname, createStyle(fontColour = "#363635", fgFill = "#F6F4F4", fontName = "Arial", fontSize = 10, border = "TopBottomLeftRight",  borderStyle = "thin"), rows = which(!even_idx) + 1, cols = 1:18, gridExpand = T)
+
+for(module in unique(enrichment_results$Module)) {
+  
+  module_indices = which(enrichment_results$Module == module) + 1
+  
+  addStyle(wb, sname, createStyle(fontColour = "#363635", fgFill = module, fontName = "Arial", fontSize = 10, textDecoration = "bold"), rows = module_indices, cols = 1, gridExpand = T)
+  
+  addStyle(wb, sname, createStyle(borderStyle = "thick", border = "top"), rows = module_indices[1], cols = 1:18, gridExpand = T, stack = T)
+  addStyle(wb, sname, createStyle(borderStyle = "thick", border = "bottom"), rows = tail(module_indices, 1), cols = 1:18, gridExpand = T, stack = T)
+}
+
+# save to Excel file
+saveWorkbook(wb, file = here(WGCNA_dir, "pathway_enrichment", "GO Enrichment Results.xlsx"), overwrite = T)
+# brainstorm::write_excel(enrichment_results, path = here("Results", "WGCNA", "pathway_enrichment", "GO Enrichment Results.xlsx"), sheet = "Enrichment Results", overwrite = T)
+```
+
+Perform Reactome enrichment.
+
+```{r reactome-enrichment}
+# Reactome downloaded from https://www.gsea-msigdb.org/gsea/msigdb/mouse/collections.jsp
+# BiocManager::install("qusage")
+gmt_path = file.path(WGCNA_dir, "pathway_enrichment", "m2.cp.reactome.v2023.2.Mm.entrez.gmt")
+reactome_mouse = qusage::read.gmt(gmt_path)
+
+library(rjson)
+json_path = file.path(WGCNA_dir, "pathway_enrichment", "m2.cp.reactome.v2023.2.Mm.json")
+reactome_json = fromJSON(paste(readLines(json_path), collapse=""))
+
+# ID = reactome_json[.y]["exactSource"]
+reactome_gene_sets = imap(reactome_mouse, ~newGeneSet(geneEntrez = .x, geneEvidence = rep("other", length(.x)), geneSource = rep("M2:CP:Reactome", length(.x)), ID = .y, name = .y, description = .y, source = "Reactome", internalClassification = .y, groups = c(), organism = "mouse"))
+
+RCTMcollection = newCollection(dataSets = reactome_gene_sets) # organism = "mouse"
+
+# perform enrichment analysis
+RCTMenrichment = enrichmentAnalysis(
+  classLabels = finalOutput$Colors, identifiers = finalOutput$EntrezID,
+  refCollection = RCTMcollection,
+  useBackground = "given",
+  threshold = 1, thresholdType = "Bonferroni",
+  maxReportedOverlapGenes = 10000,
+  getOverlapEntrez = TRUE, getOverlapSymbols = TRUE,
+  ignoreLabels = "grey")
+collectGarbage()
+
+# save RDS output
+saveRDS(RCTMenrichment, file = here("Results", "WGCNA", "pathway_enrichment", "reactome_enrichment.RDS"))
+
+# get results table
+reactome_enrichment_results = RCTMenrichment$enrichmentTable %>%
+  as.data.table() %>%
+  .[, inGroups := NULL] %>%
+  .[, GeneName := map_chr(overlapGenes, ~extract_names(.x, 2))] %>%
+  .[, EntrezID := map_chr(overlapGenes, ~extract_names(.x, 1))] %>%
+  .[, overlapGenes := NULL] %>%
+  .[, shortDataSetName := NULL] %>%
+  # .[, newID := map_chr(dataSetID, ~paste(reactome_json[.x]["exactSource"]), collapse = "_")]
+  setnames(old = c("class", "rank", "dataSetID", "dataSetName", "pValue", "Bonferroni", "FDR", "nCommonGenes", "fracOfEffectiveClassSize", "expectedFracOfEffectiveClassSize", "enrichmentRatio", "classSize", "effectiveClassSize", "fracOfEffectiveSetSize", "effectiveSetSize", "GeneName", "EntrezID"),
+           new = c("Module", "Rank", "PathwayID", "Pathway", "pValue", "Bonferroni", "FDR", "nCommonGenes", "fracOfEffectiveClassSize", "expectedFracOfEffectiveClassSize", "enrichmentRatio", "classSize", "effectiveClassSize", "fracOfEffectiveSetSize", "effectiveSetSize", "GeneName", "EntrezID")) %>%
+  .[, PathwayID := NULL] %>%
+  .[, Pathway := gsub("REACTOME_", "", Pathway)] %>%
+  .[, Pathway := gsub("_", " ", Pathway)] %>%
+  .[, Pathway := tolower(Pathway)]
+
+# write excel file
+wb = createWorkbook()
+sname = "Enrichment Results"
+brainstorm::add_worksheet(wb, sheet = "Enrichment Results", table = reactome_enrichment_results)
+setColWidths(wb, sname, cols = 1:16, widths = "auto")
+setColWidths(wb, sname, cols = 3, widths = 60)
+freezePane(wb, sname, firstRow = TRUE, firstCol = TRUE)
+  
+even_idx = as.integer(as.factor(reactome_enrichment_results$Module)) %% 2 == 0
+even_idx[is.na(even_idx)] = FALSE
+addStyle(wb, sname, createStyle(fontColour = "#363635", fgFill = "#FFFFFF", fontName = "Arial", fontSize = 10, border = "TopBottomLeftRight", borderStyle = "thin"), rows = which(even_idx) + 1, cols = 1:16, gridExpand = T)
+addStyle(wb, sname, createStyle(fontColour = "#363635", fgFill = "#F6F4F4", fontName = "Arial", fontSize = 10, border = "TopBottomLeftRight",  borderStyle = "thin"), rows = which(!even_idx) + 1, cols = 1:16, gridExpand = T)
+
+for(module in unique(reactome_enrichment_results$Module)) {
+  
+  module_indices = which(reactome_enrichment_results$Module == module) + 1
+  
+  addStyle(wb, sname, createStyle(fontColour = "#363635", fgFill = module, fontName = "Arial", fontSize = 10, textDecoration = "bold"), rows = module_indices, cols = 1, gridExpand = T)
+  
+  addStyle(wb, sname, createStyle(borderStyle = "thick", border = "top"), rows = module_indices[1], cols = 1:16, gridExpand = T, stack = T)
+  addStyle(wb, sname, createStyle(borderStyle = "thick", border = "bottom"), rows = tail(module_indices, 1), cols = 1:16, gridExpand = T, stack = T)
+}
+
+# save to Excel file
+saveWorkbook(wb, file = here(WGCNA_dir, "pathway_enrichment", "Reactome Enrichment Results.xlsx"), overwrite = T)
+```
+
+
+Make bar plots of enrichment results.
+
+```{r go-bar}
+# create bar plots
+for (module in gsub("ME", "", stata_df$V1)) { # module_list
+  
+  # subset pathways to FDR < 0.25
+  sig_pathways = enrichment_results[Module == module] %>%
+    .[FDR < 0.25, ]
+  
+  # only plot pathways if available
+  if (nrow(sig_pathways) == 0) {
+    next
+  }
+  
+  # limit to top 20 pathways
+  if (nrow(sig_pathways) > 20) {
+    sig_pathways = sig_pathways[1:20, ]
+  }
+  
+  # order by rank
+  sig_pathways = sig_pathways %>%
+    .[order(Rank)] %>%
+    .[, Pathway := factor(Pathway, levels = rev(Pathway), labels = rev(Pathway))]
+  
+  # plot barplot
+  wgcna_bp = ggplot(sig_pathways, aes(y = Pathway, x = -log10(FDR))) +
+    geom_bar(stat = "identity", fill = sig_pathways$Module[1], color = "black") +
+    scale_x_continuous(expand = expansion(c(0, 0.05))) +
+    theme_bw() +
+    theme(
+      axis.title = element_text(face = "bold")
+    )
+  
+  ggsave(here(WGCNA_dir, "pathway_enrichment", "go_bar_plots", paste0(module, "_plot.pdf")), width = 8, height = nrow(sig_pathways)/4 + 0.8)
+  
+}
+
+```
+
+Reactome bar plots.
+
+```{r reactome-bar}
+top_10 = TRUE
+
+# create bar plots
+for (module in gsub("ME", "", stata_df$V1)) { # module_list
+  
+  # subset pathways to FDR < 0.25
+  sig_pathways = reactome_enrichment_results[Module == module] %>%
+    # .[FDR < 0.25, ]
+    .[FDR < 1, ]
+  
+  # only plot pathways if available
+  if (nrow(sig_pathways) == 0) {
+    next
+  }
+  
+  # limit to top 20 pathways
+  if (nrow(sig_pathways) > 20) {
+    sig_pathways = sig_pathways[1:20, ]
+  }
+  
+  if (top_10) {
+    if (nrow(sig_pathways) > 10) {
+      sig_pathways = sig_pathways[1:10, ]
+    }
+  }
+  
+  # order by rank
+  sig_pathways = sig_pathways %>%
+    .[order(Rank)] %>%
+    .[, Pathway := factor(Pathway, levels = rev(Pathway), labels = rev(Pathway))]
+  
+  # plot barplot
+  wgcna_bp = ggplot(sig_pathways, aes(y = Pathway, x = -log10(FDR))) +
+    geom_bar(stat = "identity", fill = sig_pathways$Module[1], color = "black") +
+    geom_vline(xintercept = -log10(0.25), linetype = "dashed", color = "red") +
+    scale_x_continuous(expand = expansion(c(0, 0.05))) +
+    theme_bw() +
+    theme(
+      axis.title = element_text(face = "bold")
+    )
+  
+  if (top_10) { 
+    
+    ggsave(here(WGCNA_dir, "pathway_enrichment", "reactome_bar_plots", "top_10", paste0(module, "_plot.pdf")), width = 8, height = nrow(sig_pathways)/4 + 0.8)
+    
+  } else {
+    
+    ggsave(here(WGCNA_dir, "pathway_enrichment", "reactome_bar_plots", paste0(module, "_plot.pdf")), width = 8, height = nrow(sig_pathways)/4 + 0.8)
+    
+  }
+  
+}
+
+```
+
+
+
+# Make Bar Plots
+
+Download MSigDB XML file (deprecated, may need to replace with SQLite database in future release) from [www.gsea-msigdb.org/gsea/downloads.jsp](https://www.gsea-msigdb.org/gsea/downloads.jsp).
+
+```{r parse-msigdb}
+# load XML library
+library(XML)
+
+# parse XML file
+msigdb_xml = xmlParse(here("Data", "GSEA", "msigdb_v2023.1.Mm.xml"))
+msigdb_xml = xmlToList(msigdb_xml)
+xml_lengths = map_dbl(msigdb_xml, length)
+msigdb_xml = msigdb_xml[xml_lengths == 26]
+
+# read data frame
+msigdb_df = do.call(rbind, msigdb_xml) %>% as.data.table()
+msigdb_df = msigdb_df[SUB_CATEGORY_CODE %in% c("CP:REACTOME", "GO:BP", "GO:CC", "GO:MF")] %>%
+  .[, GSEA_NAME := STANDARD_NAME]
+setcolorder(msigdb_df, "GSEA_NAME")
+```
+
+Iterate through GSEA directories to get pathways.
+
+```{r get-pathways}
+# function to get list of GSEA contrasts
+get_GSEA_contrasts = function(gsea_version = "GSEA") {
+  # define GSEA path
+  gsea_dir = here("Results", gsea_version, "only_coding_genes")
+  gsea_contrasts = list.dirs(gsea_dir, recursive = FALSE)
+  gsea_contrasts = gsea_contrasts[!grepl("input_files", gsea_contrasts)]
+  return(gsea_contrasts)
+}
+
+# function to get GSEA results
+get_GSEA = function(gsea_path, gsea_version = "GSEA") {
+  
+  # get contrast label
+  contrast_label = basename(gsea_path) %>%
+    { strsplit(., "_")[[1]][1:3] } %>%
+    paste(collapse = " ") %>%
+    gsub(" vs ", " vs. ", .)
+  
+  # define GSEA directory
+  # e.g., gsea_path = gsea_contrasts[1]
+  tsv = list.files(gsea_path, pattern = "^.*\\.tsv$")
+  tsv = tsv[grepl("gsea_report", tsv)]
+  
+  # get contrast results
+  contrast_results = data.table()
+  if (gsea_version == "GSEA") {
+    tsv_labels = map_chr(tsv, ~strsplit(.x, "_")[[1]][4])
+  } else {
+    tsv_labels = map_chr(tsv, ~strsplit(.x, "_")[[1]][5])
+  }
+  
+  # regulation labels
+  reg_labels = factor(tsv_labels, levels = tsv_labels, labels = c("Downregulated", "Upregulated"))
+  
+  for(tsv_index in 1:length(tsv)) {
+    
+    # read GSEA results
+    gsea_results = fread(here(gsea_path, tsv[tsv_index]), check.names = TRUE) %>%
+      .[, c("GS.br..follow.link.to.MSigDB", "GS.DETAILS", "RANK.AT.MAX", "LEADING.EDGE", "V12") := NULL]
+    
+    # merge GSEA results
+    merged_gsea = merge(gsea_results, msigdb_df, by.x = "NAME", by.y = "STANDARD_NAME", all.x = T, all.y = F, sort = F) %>%
+      .[, Comparison := tsv_labels[tsv_index]] %>%
+      .[, Regulation := reg_labels[tsv_index]] %>%
+      .[, Contrast := contrast_label]
+    
+    # rbind to results table
+    contrast_results = rbind(contrast_results, merged_gsea)
+    
+  }
+  
+  # set column order
+  setcolorder(contrast_results, c("Contrast", "Comparison", "Regulation"))
+  
+  # rename name column
+  contrast_results %>%
+    .[, NAME := gsub("(REACTOME_)|(GOBP_)|(GOMF_)|(GOCC_)", "", NAME)] %>%
+    .[, NAME := gsub("_", " ", NAME)] %>%
+    .[, NAME := tolower(NAME)]
+  
+  # return contrast results
+  return(contrast_results)
+  
+}
+
+# get contrasts for GSEA and GSEA preranked
+gsea_contrasts = get_GSEA_contrasts("GSEA")
+gsea_preranked_contrasts = get_GSEA_contrasts("GSEA_preranked")
+
+# map over gsea results
+gsea_pathways = map_dfr(gsea_contrasts, ~get_GSEA(.x, "GSEA")) %>%
+  .[FDR.q.val <= 0.25]
+gsea_preranked_pathways = map_dfr(gsea_preranked_contrasts, ~get_GSEA(.x, "GSEA_preranked")) %>%
+  .[FDR.q.val <= 0.25]
+
+# save GSEA results to file
+gsea_pathways = gsea_pathways %>%
+  .[, .(Contrast, Comparison, NAME, SIZE, ES, NES, NOM.p.val, FDR.q.val, FWER.p.val, CONTRIBUTOR, SUB_CATEGORY_CODE, EXACT_SOURCE, DESCRIPTION_BRIEF, MEMBERS_SYMBOLIZED, MEMBERS_EZID)]
+setnames(gsea_pathways, c("NAME", "SIZE", "NOM.p.val", "FDR.q.val", "FWER.p.val", "CONTRIBUTOR", "SUB_CATEGORY_CODE", "EXACT_SOURCE", "DESCRIPTION_BRIEF", "MEMBERS_SYMBOLIZED", "MEMBERS_EZID"), c("Name", "Size", "Nominal p-Val", "FDR q-Val", "FWER p-Val", "Ontology", "Database", "ID", "Description", "Genes", "Entrez"))
+
+# # write to file
+# fwrite(gsea_pathways, here("Results", "GSEA", "pathways", "GSEA_significant_pathways.csv"))
+# 
+# # save to Excel
+# brainstorm::write_excel(gsea_pathways, here("Results", "GSEA", "pathways", "GSEA_significant_pathways.xlsx"), sheet = "Q < 0.25 Pathways", overwrite = T)
+```
+
+Cluster preranked pathways by Jaccard index.
+
+```{r jaccard-cluster}
+cluster_jaccard = function(contrast, contrast_color, wb) {
+
+  # clustering pathway
+  clust_path = here("Results", "GSEA_preranked", "pathways")
+  
+  # subset pathways
+  # e.g., contrast = "WT vs. GFP"
+  pathways_to_compare = gsea_preranked_pathways[Contrast == contrast]
+  
+  # pathway members
+  mem = sapply(pathways_to_compare[, MEMBERS_SYMBOLIZED], function(x) strsplit(x, ","))
+  names(mem) = pathways_to_compare[, NAME]
+  
+  # function to compute Jaccard similarity
+  jaccard = function(a, b) {return(length(intersect(a,b))/length(union(a, b)))}
+  
+  # compute jaccard similarity matrix
+  sim = data.frame(matrix(nrow = length(mem), ncol = length(mem)))
+  for (m in 1:length(mem)) {
+    mem_i = sapply(mem, function(x) jaccard(unlist(mem[m]), unlist(x)))
+    sim[, m] = mem_i
+  }
+  rownames(sim) = names(mem); colnames(sim) = names(mem)
+  
+  # turn similarity matrix to dissimilarity matrix
+  diss = as.dist(1 - sim)
+        
+  # perform hierarchical clustering
+  pathway_clust = hclust(diss)
+  
+  # cut dendrogram
+  thresh = 0.9999999
+  pathway_cut = cutree(pathway_clust, h = thresh)
+  cat(paste0(contrast, " Clusters: ", max(pathway_cut), "\n"))
+  pathway_dend = as.dendrogram(pathway_clust)
+  
+  # plot dendrogram
+  pdf(here(clust_path, paste(contrast, "Dendrogram.pdf", sep = " ")), width = 10, height = 6, pointsize = 6)
+  par(mar = c(5, 5, 0, 20))
+  plot(pathway_dend, xlab = "Height", ylab = "Pathway", horiz = TRUE, cex.lab = 1.5, cex.axis = 2)
+  abline(v = thresh, col = "red", lty = 2)
+  dev.off()
+  
+  # add pathway identity to data table
+  pathways_to_compare[, Cluster := pathway_cut]
+  setcolorder(pathways_to_compare, "Cluster")
+  pathways_to_compare = pathways_to_compare[order(Cluster), ] %>%
+    .[, .(Cluster, Contrast, Comparison, Regulation, NAME, SIZE, ES, NES, NOM.p.val, FDR.q.val, FWER.p.val, CONTRIBUTOR, SUB_CATEGORY_CODE, EXACT_SOURCE, DESCRIPTION_BRIEF, MEMBERS_SYMBOLIZED, MEMBERS_EZID)]
+  setnames(pathways_to_compare, c("NAME", "SIZE", "NOM.p.val", "FDR.q.val", "FWER.p.val", "CONTRIBUTOR", "SUB_CATEGORY_CODE", "EXACT_SOURCE", "DESCRIPTION_BRIEF", "MEMBERS_SYMBOLIZED", "MEMBERS_EZID"), c("Name", "Size", "Nominal p-Val", "FDR q-Val", "FWER p-Val", "Ontology", "Database", "ID", "Description", "Genes", "Entrez"))
+  pathways_to_annotate = copy(pathways_to_compare)
+  
+  # add rows for manual annotation
+  setDF(pathways_to_annotate)
+  header_idx = which(!duplicated(pathways_to_annotate$Cluster))
+  for (z in 1:length(header_idx)) {
+    pathways_to_annotate = dplyr::add_row(pathways_to_annotate, .before = header_idx[z])
+    header_idx = header_idx + 1
+  }
+  
+  # update header indices
+  header_idx = which(is.na(pathways_to_annotate$Cluster))
+  
+  # iterate through clusters
+  for (z in 1:length(header_idx)) {
+    
+    # if final cluster in the list, go to end of table
+    if(z == length(header_idx)) {
+      clus = pathways_to_annotate[(header_idx[z]+1):nrow(pathways_to_annotate), ]
+    } else {
+      clus = pathways_to_annotate[(header_idx[z]+1):(header_idx[z+1]-1), ]
+    }
+    
+    # average Size/ES/NES of pathways in the cluster
+    pathways_to_annotate[header_idx[z], "Cluster"] = paste0("Cluster #", pathways_to_annotate[header_idx[z]+1, "Cluster"])
+    pathways_to_annotate[header_idx[z], "Size"] = mean(clus[, "Size"])
+    pathways_to_annotate[header_idx[z], "ES"] = mean(clus[, "ES"])
+    pathways_to_annotate[header_idx[z], "NES"] = mean(clus[, "NES"])
+    pathways_to_annotate[header_idx[z], "Cluster"] = pathways_to_annotate[header_idx[z]+1, "Cluster"]
+          
+  }
+  
+  # add to workbook
+  sname = contrast
+  hs = createStyle(fontColour = "#FAF3DD", fgFill = "#5171A5", fontName = "Arial Black",
+                   halign = "left", valign = "center", textDecoration = "Bold",
+                   border = "Bottom", borderStyle = "thick", fontSize = 14)
+        
+  addWorksheet(wb, sheetName = sname, tabColour = contrast_color)
+  writeDataTable(wb, sname, x = pathways_to_annotate, tableStyle = "TableStyleMedium15", headerStyle = hs, bandedRows = FALSE)
+  setColWidths(wb, sname, cols = 1:17, widths = "auto")
+  setColWidths(wb, sname, cols = 5, widths = 60)
+  freezePane(wb, sname, firstRow = TRUE, firstCol = FALSE)
+  
+  even_idx = as.integer(pathways_to_annotate$Cluster) %% 2 == 0
+  even_idx[is.na(even_idx)] = FALSE
+  addStyle(wb, sname, createStyle(fontColour = "#363635", fgFill = "#FAF3DD", fontName = "Arial", fontSize = 10), rows = which(even_idx) + 1, cols = 1:17, gridExpand = T)
+  addStyle(wb, sname, createStyle(fontColour = "#363635", fgFill = "#C4E4E9", fontName = "Arial", fontSize = 10), rows = which(!even_idx) + 1, cols = 1:17, gridExpand = T)
+        
+  addStyle(wb, sname, createStyle(fontColour = "#363635", fgFill = "#FFA69E", fontName = "Arial",
+                                  textDecoration = "Bold", border = "TopBottom",borderStyle = "thick"),
+           rows = which(is.na(pathways_to_annotate$Name)) + 1, cols = 1:17, gridExpand = T)
+  
+  return(pathways_to_compare)
+  
+}
+
+# unique contrast list
+# contrast_list = unique(gsea_preranked_pathways$Contrast)
+
+# color scheme for contrasts
+cluster_contrast_names = gsub("_vs_", " vs. ", contrast_names)
+cluster_contrast_colors = c("#FAE1DD", "#FCD5CE", "#FEC5BB", "#E8E8E4", "#D8E2DC", "#C1D8EC")
+names(cluster_contrast_colors) = cluster_contrast_names
+
+# # create workbook
+# wb = createWorkbook()
+# 
+# # map function over DEG results
+# walk(cluster_contrast_names, ~cluster_jaccard(.x, cluster_contrast_colors[[.x]], wb))
+# 
+# # save workbook
+# openxlsx::saveWorkbook(wb, file = here("Results", "GSEA_preranked", "pathways", "GSEA_preranked_jaccard_clustering.xlsx"), overwrite = TRUE)
+```
+
+Create bar plots for GSEA standard results.
+
+```{r standard-plot}
+# order pathways for plot
+gsea_pathways_plot = copy(gsea_pathways) %>%
+  .[order(-NES), ] %>%
+  .[grepl("ubiquitin dependent protein catabolic process", Name), Name := "ubiquitin dependent protein catabolic process"] %>%
+  .[, Name := factor(Name, levels = Name)]
+
+# create plot
+p = ggplot(data = gsea_pathways_plot, aes(x = Name, y = NES, fill = log(`Nominal p-Val` + (10^-10)), group = Contrast)) +
+  geom_bar(stat="identity") +
+  # scale_fill_gradient(low = "#7899D4", mid = "#E3E0DD", high = "#B24C63") +
+  # scale_fill_gradientn(colors = colorRampPalette(c("#7899D4", "#FCFCFE", "#FEFEFE", "#FFFFFF", "#FEFEFE", "#FDFBFB", "#B24C63"))(100)) +
+  scale_fill_gradientn(colors = colorRampPalette(ggsci::pal_gsea()(12)[1:5])(100)) +
+  xlab("Pathway") +
+  ylab("Normalized Enrichment Score (NES)") +
+  theme_linedraw() +
+  theme(plot.title = element_text(size = 16, hjust = 0.5, face = "bold"),
+        axis.title.x = element_text(size = 12, face = "bold"),
+        axis.title.y = element_text(size = 12, face = "bold"),
+        legend.title = element_text(size = 12, face = "bold"),
+        axis.ticks.x = element_blank(),
+        panel.grid.major = element_line(color = "#EBEBEB", linewidth = 0.2),
+        panel.grid.minor = element_line(color = "#EBEBEB", linewidth = 0.2),
+        panel.background = element_rect(fill = "#FAFAFA"),
+        panel.border = element_rect(color = "#41414E"),
+        strip.text = element_text(size = 12, face = "bold", color = "#FAFAFA"),
+        strip.background = element_rect(color="#41414E", fill = "#41414E", linetype="solid"),
+        legend.position = "bottom"
+        ) +
+  coord_flip(ylim = c(min(gsea_pathways_plot$NES) - 0.1, 0)) +
+  scale_y_continuous(expand = expansion(c(0, 0))) +
+  ggforce::facet_col(facets = Contrast ~ ., scales = "free_y", space = "free")
+  # facet_grid(Contrast ~ ., scales = "free_y", space = "free_y")
+
+# save to file
+ggsave(here("Results", "GSEA", "pathways", "GSEA_significant_pathways.pdf"), p, width = 8, height = 8)
+```
+
+Read in annotated superpathways from GSEA pre-ranked results.
+
+```{r read-preranked}
+# get superpathways
+get_superpathways = function(sheet_name) {
+  
+  # get file path
+  annot_path = here("Results", "GSEA_preranked", "pathways", "GSEA Preranked Jaccard Clustering_asp.xlsx")
+    
+    # read pre-ranked and get super pathways
+    # e.g., sheet_name = sheet_names[1]
+    contrast_pathways = read.xlsx(annot_path, sheet = sheet_name) %>%
+      as.data.table()
+    
+    # get contrast name
+    sheet_contrast = unique(contrast_pathways[!is.na(Contrast), Contrast])
+    
+    contrast_pathways = contrast_pathways %>%
+      .[is.na(Contrast)] %>%
+      .[, Contrast := sheet_contrast] %>%
+      .[, .(Cluster, Contrast, Name, Size, ES, NES)]
+    
+    # return contrast pathways
+    return(contrast_pathways)
+  
+}
+
+# get sheet names
+sheet_names = getSheetNames(annot_path)
+
+# read superpathways
+superpathways = map_dfr(sheet_names, get_superpathways)
+```
+
+Create bar plots for GSEA preranked results.
+
+```{r preranked-plot}
+# order pathways for plot
+superpathways_plot = copy(superpathways) %>%
+  .[order(Contrast, NES), ] %>%
+  .[, Name := factor(Name, levels = make.unique(Name), labels = Name)]
+
+# create plot
+p = ggplot(data = superpathways_plot, aes(x = Name, y = NES, fill = NES, group = Contrast)) +
+  geom_bar(stat="identity") +
+  scale_fill_gradientn(colors = ggsci::pal_gsea()(12)) +
+  xlab("Pathway") +
+  ylab("Normalized Enrichment Score (NES)") +
+  theme_linedraw() +
+  theme(plot.title = element_text(size = 16, hjust = 0.5, face = "bold"),
+        axis.title.x = element_text(size = 12, face = "bold"),
+        axis.title.y = element_text(size = 12, face = "bold"),
+        legend.title = element_text(size = 12, face = "bold"),
+        axis.ticks.x = element_blank(),
+        panel.grid.major = element_line(color = "#EBEBEB", linewidth = 0.2),
+        panel.grid.minor = element_line(color = "#EBEBEB", linewidth = 0.2),
+        panel.background = element_rect(fill = "#FAFAFA"),
+        panel.border = element_rect(color = "#41414E"),
+        strip.text = element_text(size = 12, face = "bold", color = "#FAFAFA"),
+        strip.background = element_rect(color="#41414E", fill = "#41414E", linetype="solid"),
+        legend.position = "bottom"
+        ) +
+  coord_flip(ylim = c(min(superpathways$NES) - 0.1, max(superpathways$NES) + 0.1)) +
+  scale_y_continuous(expand = expansion(c(0, 0))) +
+  ggforce::facet_col(facets = Contrast ~ ., scales = "free_y", space = "free")
+  # facet_grid(Contrast ~ ., scales = "free_y", space = "free_y")
+
+# save to file
+ggsave(here("Results", "GSEA_preranked", "pathways", "GSEA_significant_pathways.pdf"), p, width = 8, height = 30)
+```
+
+Create dot plot.
+
+```{r preranked-dot}
+# order pathways for plot
+superpathways_dot_plot = copy(superpathways) %>%
+  .[order(Contrast, NES), ] %>%
+  .[, Name := factor(Name, levels = make.unique(Name), labels = Name)]
+
+# create plot
+p = ggplot(data = superpathways_dot_plot, aes(x = Name, y = NES, color = NES, group = Contrast)) +
+  geom_point(aes(size = Size)) +
+  scale_color_gradientn(colors = ggsci::pal_gsea()(12)) +
+  xlab("Pathway") +
+  ylab("Normalized Enrichment Score (NES)") +
+  theme_linedraw() +
+  theme(plot.title = element_text(size = 16, hjust = 0.5, face = "bold"),
+        axis.title.x = element_text(size = 12, face = "bold"),
+        axis.title.y = element_text(size = 12, face = "bold"),
+        legend.title = element_text(size = 12, face = "bold"),
+        axis.ticks.x = element_blank(),
+        panel.grid.major = element_line(color = "#EBEBEB", linewidth = 0.2),
+        panel.grid.minor = element_line(color = "#EBEBEB", linewidth = 0.2),
+        panel.background = element_rect(fill = "#FAFAFA"),
+        panel.border = element_rect(color = "#41414E"),
+        strip.text = element_text(size = 12, face = "bold", color = "#FAFAFA"),
+        strip.background = element_rect(color="#41414E", fill = "#41414E", linetype="solid"),
+        legend.position = "bottom"
+        ) +
+  coord_flip(ylim = c(min(superpathways$NES) - 0.1, max(superpathways$NES) + 0.1)) +
+  scale_y_continuous(expand = expansion(c(0, 0))) +
+  ggforce::facet_col(facets = Contrast ~ ., scales = "free_y", space = "free")
+  # facet_grid(Contrast ~ ., scales = "free_y", space = "free_y")
+
+# save to file
+ggsave(here("Results", "GSEA_preranked", "pathways", "GSEA_significant_pathways_dot_plot.pdf"), p, width = 8, height = 30)
+```

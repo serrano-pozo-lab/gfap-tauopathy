@@ -1,0 +1,211 @@
+---
+title: "Mass Spectrometry Protein List Analysis"
+description: |
+  This R script analyzes and compares protein lists from three mass spectrometry experiments: THY-Tau22 mouse brains, human brains, and WJE3 astrocytes. It maps genes between mouse and human orthologs, handles unmapped genes through manual curation, and generates Venn diagrams to visualize the overlap between protein sets across different experimental conditions.
+author:
+  - first_name: "Ayush"
+    last_name: "Noori"
+    url: https://www.github.com/ayushnoori
+    affiliation: Massachusetts General Hospital
+    affiliation_url: https://www.serranopozolab.org
+    orcid_id: 0000-0003-1420-1236
+output:
+  distill::distill_article:
+    toc: true
+---
+
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+# Dependencies
+
+Load requisite packages and define directories. Note that this script may also use my personal utilities package `brainstorm`, which can be downloaded via `devtools::install_github("ayushnoori/brainstorm")`.
+
+```{r load-packages, message=FALSE, warning=FALSE}
+# Data manipulation
+library(data.table)
+library(purrr)
+library(magrittr)
+
+# Plotting
+library(ggplot2)
+
+# ID mapping
+library(biomaRt)
+
+# Relative file paths
+library(here)
+
+# Excel output
+library(openxlsx)
+library(brainstorm)
+
+# Also requires BiocManager::install(c("qusage"))
+```
+
+Note that directories are relative to the R project path.
+
+```{r define-directores}
+# Set directories
+human_WJE3astro_dir = here("Data", "Mass_spec_human_WJE3astro")
+mouse_brains_dir = here("Data", "Mass_spec_mouse_brains")
+data_dir = here("Data", "Mass_spec_proteins")
+results_dir = here("Results", "Mass_spec_proteins")
+```
+
+Read gene lists and map from mouse to human and human to mouse.
+
+```{r read-data}
+# Read lists
+gene_lists = list(
+  AD_CTRL = readxl::read_excel(here(human_WJE3astro_dir, "Gfap_IP_protein_lists_for_Ayush_07302024.xlsx"), sheet = "AD+CTRL 1.5-fold GFAP IP vs IgG") %>% as.data.table(),
+  MsWt_MtGfapMyc = readxl::read_excel(here(human_WJE3astro_dir, "Gfap_IP_protein_lists_for_Ayush_07302024.xlsx"), sheet = "Ms Wt+Mt Gfap-Myc IP vs. GFP") %>% as.data.table()
+)
+
+# Get intersection of gene lists
+mouse_gene_list = readxl::read_excel(here(mouse_brains_dir, "List of 89 proteins false for GFP.xlsx"), sheet = "Functional Annotations") %>% as.data.table() %>% .$Gene
+human_gene_list = gene_lists$AD_CTRL$Protein
+astro_gene_list = gene_lists$MsWt_MtGfapMyc$Protein
+astro_gene_list = astro_gene_list[!astro_gene_list %in% c("Igkv8-26", "NA")]
+
+# Convert mouse to human and human to mouse
+human = useMart("ensembl", dataset = "hsapiens_gene_ensembl", host = "https://dec2021.archive.ensembl.org/")
+mouse = useMart("ensembl", dataset = "mmusculus_gene_ensembl", host = "https://dec2021.archive.ensembl.org/")
+
+# mouse to human
+mouse_to_human = function(x) {
+  return(getLDS(attributes = c("mgi_symbol"), filters = "mgi_symbol", values = x, mart = mouse, attributesL = c("hgnc_symbol"), martL = human, uniqueRows=T))
+}
+
+human_to_mouse = function(x) {
+  return(getLDS(attributes = c("hgnc_symbol"), filters = "hgnc_symbol", values = x, mart = human, attributesL = c("mgi_symbol"), martL = mouse, uniqueRows=T))
+}
+
+mm_genes = list(
+  mouse_brains = mouse_gene_list,
+  human = unique(human_to_mouse(human_gene_list)[["MGI.symbol"]]),
+  astro = astro_gene_list
+)
+
+hs_genes = list(
+  mouse_brains = unique(mouse_to_human(mouse_gene_list)[["HGNC.symbol"]]),
+  human = human_gene_list,
+  astro = unique(mouse_to_human(astro_gene_list)[["HGNC.symbol"]])
+)
+
+# Print results
+# Note that some genes have a 1:many mapping, so the final count may be inflated
+# This is corrected by the manual conversion of any unmapped genes
+message("Mouse brains: ", length(mm_genes$mouse_brains), " genes --> ", length(hs_genes$mouse_brains), " genes")
+message("Human: ", length(hs_genes$human), " genes --> ", length(mm_genes$human), " genes")
+message("WJE3 astrocytes: ", length(mm_genes$astro), " genes --> ", length(hs_genes$astro), " genes")
+# Mouse brains: 87 genes --> 77 genes
+# Human: 100 genes --> 98 genes
+# WJE3 astrocytes: 32 genes --> 28 genes
+
+# Get full mapping tables
+gene_mappings = list(
+  mouse_brains = mouse_to_human(mouse_gene_list),
+  human = human_to_mouse(human_gene_list),
+  astro = mouse_to_human(astro_gene_list)
+)
+
+# Add unmapped genes via manual conversion
+# https://www.ncbi.nlm.nih.gov/gene/?term=(Hspd1)+AND+%22Mus+musculus%22%5Bporgn%3A__txid10090%5D
+# Search term: (Rpl11) AND "Mus musculus"[porgn:__txid10090] 
+# Check orthologs manually in "Summary" or click "Orthologs" > "human"
+mouse_brains_not_mapped = mouse_gene_list[!mouse_gene_list %in% gene_mappings$mouse_brains$MGI.symbol]
+unmapped_mouse_brains_df = data.frame(
+  MGI.symbol = mouse_brains_not_mapped,
+  HGNC.symbol = c("FLT3LG", "RAB7A", "RPL11", "RPS3A", "VDAC1", "HSPD1", "ATP5F1B", "TARS1", "RPL17", "H1-4", "HMGA1", "RPS18")
+)
+
+# For Gm6133, checked in UniProt: https://www.uniprot.org/uniprotkb/B2RY53/entry
+# Searched alias, "Large ribosomal subunit protein uL22" in NCBI Ensembl
+# First human hit was RPL17
+
+# For Rps18-ps6, checked in UniProt: https://www.uniprot.org/uniprotkb/F6YVP7/entry
+# Searched alias, "Small ribosomal subunit protein uS13" in NCBI Ensembl
+# First human hit was RPS18
+
+# Search term: (NEFM) AND "Homo sapiens"[porgn:__txid9606] 
+human_not_mapped = human_gene_list[!human_gene_list %in% gene_mappings$human$HGNC.symbol]
+unmapped_human_df = data.frame(
+  HGNC.symbol = human_not_mapped,
+  MGI.symbol = c("Nefm", "Eif4a2", "Rpl9", "Vdac1")
+)
+
+# Search term: (Dnaja1) AND "Mus musculus"[porgn:__txid10090]
+astro_not_mapped = astro_gene_list[!astro_gene_list %in% gene_mappings$astro$MGI.symbol]
+unmapped_astro_df = data.frame(
+  MGI.symbol = astro_not_mapped,
+  HGNC.symbol = c("DNAJA1", "VDAC1", "MYL12A", "ATP5F1B")
+)
+
+# Add manually converted unmapped genes back to mapping tables
+gene_mappings$mouse_brains = rbind(unmapped_mouse_brains_df, gene_mappings$mouse_brains)
+gene_mappings$human = rbind(unmapped_human_df, gene_mappings$human)
+gene_mappings$astro = rbind(unmapped_astro_df, gene_mappings$astro)
+
+# Add experiment column
+gene_mappings$mouse_brains[["experiment"]] = "THY-Tau22"
+gene_mappings$human[["experiment"]] = "Human brain"
+gene_mappings$astro[["experiment"]] = "WJE3 astrocytes"
+
+# Combine final result
+IP_proteins = rbind(gene_mappings$mouse_brains, gene_mappings$human, gene_mappings$astro) %>%
+  as.data.table() %>%
+  setnames(c("MGI.symbol", "HGNC.symbol"), c("mouse", "human"))
+```
+
+Compute Venn diagram.
+
+```{r compute-intersection}
+# Remove duplicates from each species column for each experiment
+mouse_genes = list(
+  THY_Tau22 = unique(IP_proteins[experiment == "THY-Tau22", mouse]),
+  Human_brains = unique(IP_proteins[experiment == "Human brain", mouse]),
+  WJE3_astrocytes = unique(IP_proteins[experiment == "WJE3 astrocytes", mouse])
+)
+
+human_genes = list(
+  THY_Tau22 = unique(IP_proteins[experiment == "THY-Tau22", human]),
+  Human_brains = unique(IP_proteins[experiment == "Human brain", human]),
+  WJE3_astrocytes = unique(IP_proteins[experiment == "WJE3 astrocytes", human])
+)
+
+# Compute pairwise intersection
+mouse_venn = list(
+  THY_Tau22_and_Human_brain = intersect(mouse_genes$THY_Tau22, mouse_genes$Human_brain),
+  THY_Tau22_and_WJE3_astrocytes = intersect(mouse_genes$THY_Tau22, mouse_genes$WJE3_astrocytes),
+  Human_brain_and_WJE3_astrocytes = intersect(mouse_genes$Human_brain, mouse_genes$WJE3_astrocytes),
+  All = Reduce(intersect, mouse_genes)
+)
+
+human_venn = list(
+  THY_Tau22_and_Human_brains = intersect(human_genes$THY_Tau22, human_genes$Human_brain),
+  THY_Tau22_and_WJE3_astrocytes = intersect(human_genes$THY_Tau22, human_genes$WJE3_astrocytes),
+  Human_brain_and_WJE3_astrocytes = intersect(human_genes$Human_brain, human_genes$WJE3_astrocytes),
+  All = Reduce(intersect, human_genes)
+)
+
+print_venn = function(pairwise_list) {
+  for (name in names(pairwise_list)) {
+    clean_name = gsub("_", " ", name)
+    cat(clean_name, ": ", paste(pairwise_list[[name]], collapse = ", "), "\n", sep = "")
+  }
+}
+
+print_venn(human_venn)
+```
+
+Create Venn diagram.
+
+```{r venn-diagram}
+# devtools::install_github("yanlinlin82/ggvenn")
+library(ggvenn)
+
+p = ggvenn(human_genes, show_stats = "c")
+```

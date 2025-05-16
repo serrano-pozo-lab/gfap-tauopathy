@@ -1,0 +1,28 @@
+---
+title: "A Novel Protective Role of Astrocytic GFAP in Tau Proteostasis"
+description: |
+  We have unraveled a novel role of the intermediate filament glial fibrillary acidic protein (GFAP)—a classic marker of reactive astrocytes—in the clearance of pTau aggregates with potentially beneficial effects in synaptic integrity.
+site: distill::distill_website
+output:
+  distill::distill_article:
+    toc: true
+---
+
+```{r include = FALSE, eval = FALSE}
+
+# Render website
+library(rmarkdown)
+library(distill)
+render_site()
+
+# Remove files
+clean_site()
+```
+
+# Documentation
+
+To read our documented code, please visit [www.serranopozolab.org/gfap-tauopathy](https://www.serranopozolab.org/gfap-tauopathy).
+
+# Code Availability
+
+Our codebase is available for download on [GitHub](https://github.com/serrano-pozo-lab/gfap-tauopathy).

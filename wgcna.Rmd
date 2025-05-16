@@ -1,0 +1,464 @@
+---
+title: "WGCNA"
+description: |
+  This R script performs Weighted Gene Co-expression Network Analysis (WGCNA) to identify co-expressed gene modules and their relationships with external traits (GFAP levels and sex) in control and AD brains. The analysis includes module detection, network visualization, and correlation analysis with phenotypic traits.
+author:
+  - first_name: "Ayush"
+    last_name: "Noori"
+    url: https://www.github.com/ayushnoori
+    affiliation: Massachusetts General Hospital
+    affiliation_url: https://www.serranopozolab.org
+    orcid_id: 0000-0003-1420-1236
+output:
+  distill::distill_article:
+    toc: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+See WGCNA tutorials [here](https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/Rpackages/WGCNA/Tutorials/index.html).
+
+# Dependencies
+
+Load requisite packages and define directories. Also requires the `qusage` package from Bioconductor to parse GMT files.
+
+```{r load-packages, message=FALSE, warning=FALSE}
+library(Biobase)
+library(WGCNA)
+library(data.table)
+library(purrr)
+library(magrittr)
+library(openxlsx)
+library(here)
+
+# personal utilities library
+library(brainstorm)
+```
+
+Note that directories are relative to the R project path. GMT file is read into R using the `qusage` package (see documentation [here](http://www.bioconductor.org/packages/release/bioc/html/qusage.html)).
+
+```{r define-directores}
+# set directories
+RNAseq_dir = here("Results", "RNA_seq")
+WGCNA_dir = here("Results", "WGCNA")
+```
+
+# Read Data
+
+```{r read-data}
+# read limma voom data
+dge = readRDS(file = here(RNAseq_dir, "RNAseq_DGE.RDS"))
+v = readRDS(file = here(RNAseq_dir, "RNAseq_voom.RDS"))
+
+# read data
+counts = dge$counts
+log_counts = v$E
+smap = v$targets
+genes = v$genes
+
+# check correlation
+# tmp = log2(counts)
+# counts_log_cor = map_dbl(1:nrow(counts), ~cor(tmp[.x, ], log_counts[.x, ]))
+# mean(counts_log_cor, na.rm = TRUE)
+
+# get sample names
+samples = colnames(log_counts)
+dat = as.data.table(copy(log_counts))
+dat[, Gene.Name := rownames(log_counts)]
+setcolorder(dat, "Gene.Name")
+
+# create counts data.table
+dat_raw = as.data.table(copy(counts))
+dat[, Gene.Name := rownames(counts)]
+setcolorder(dat, "Gene.Name")
+
+# create WGCNA object
+WGCNAgenes = as.data.frame(dat[, ..samples])
+rownames(WGCNAgenes) = dat[, Gene.Name]
+```
+
+# Quality Control
+
+Remove non-variant genes.
+
+```{r remove-nv}
+# identify non-variant genes
+variancedatExpr = dat[, pmap_dbl(.SD, ~sd(c(...), na.rm=T)), .SDcols = samples]
+meandatExpr = dat[, pmap_dbl(.SD, ~mean(c(...), na.rm=T)), .SDcols = samples]
+ratio = variancedatExpr/meandatExpr
+BadGenes = ratio < 0.1 & meandatExpr > 1000
+print(table(BadGenes))
+datExprNoVar = dat[BadGenes, ]
+if(length(which(BadGenes == TRUE)) != 0) {
+  # message("The following non-variant genes are being removed!")
+  # message(paste(rownames(WGCNAgenes[BadGenes, ]), collapse = ", "))
+  write.csv(datExprNoVar, file.path(WGCNA_dir, "Non-Variant Genes.csv"), row.names = T)
+}
+
+# remove non-variant genes
+dat = dat[!BadGenes, ]
+WGCNAgenes = WGCNAgenes[!BadGenes, ]
+```
+
+Transpose and apply additional QC steps.
+
+```{r check-quality}
+# transpose
+WGCNAgenes = t(WGCNAgenes)
+
+# remove genes and samples with too many missing values
+gsg = goodSamplesGenes(WGCNAgenes, verbose = 3)
+message("Are there genes or samples with too many missing values?")
+message(!gsg$allOK)
+
+# if there are genes or samples with too many missing values, remove them
+if (!gsg$allOK) {
+  # # print the gene and sample names that were removed
+  # if (sum(!gsg$goodGenes)>0) { print(paste("Removing Genes:", paste(colnames(WGCNAgenes)[!gsg$goodGenes], collapse = ", "))) }
+  # if (sum(!gsg$goodSamples)>0) { print(paste("Removing Samples:", paste(colrownames(WGCNAgenes)[!gsg$goodSamples], collapse = ", "))) }
+  # remove the offending genes and samples from the data
+  WGCNAgenes = WGCNAgenes[gsg$goodSamples, gsg$goodGenes]
+}
+
+# replace NA values with 0
+WGCNAgenes[is.na(WGCNAgenes)] = 0
+```
+
+# Perform WGCNA
+
+Regarding network sign, see discussion comparing signed and unsigned networks [here](https://peterlangfelder.com/2018/11/25/signed-or-unsigned-which-network-type-is-preferable/). 
+
+```{r thresholding-powers}
+# choose a set of soft-thresholding powers
+powers = c(c(1:10), seq(from=12, to=20, by=2))
+# call the network topology analysis function
+sft = pickSoftThreshold(WGCNAgenes, powerVector = powers, verbose = 5, networkType = "signed")
+
+# plot the results
+jpeg(file.path(WGCNA_dir, "Scale Indepedence and Mean Connectivity.jpg"), width = 4500, height = 2500, res = 300)
+par(mfrow = c(1,2));
+cex1 = 0.9;
+
+# scale-free topology fit index as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (Power)", ylab="Scale Free Topology Model Fit, Signed R^2", type="n",
+     main = "Scale Independence");
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels=powers, cex=cex1, col="red");
+# this line corresponds to using an R^2 cut-off of h_abline
+h_abline = 0.90
+abline(h=h_abline, col="red")
+
+# mean connectivity as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+     xlab="Soft Threshold (Power)", ylab="Mean Connectivity", type="n",
+     main = "Mean Connectivity")
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=cex1, col="red")
+
+dev.off()
+
+# find the lowest power for which the scale-free topology fit index (SFT.R.sq) reaches the R^2 cutoff (h_abline)
+softPower = sft$fitIndices$Power[which(sft$fitIndices$SFT.R.sq >= h_abline)[1]]
+if(is.na(softPower)) {softPower = 6}
+# softPower = 6 # set soft-thresholding power to 6 (for now)
+message("Soft-Thresholding Power is ", softPower)
+```
+
+Compute adjacencies, then perform hierarchical clustering.
+
+```{r compute-adjacencies}
+# compute the adjacencies using the calculated soft-thresholding power
+adjacency = adjacency(WGCNAgenes, power = softPower, type = "signed")
+
+# transform adjacency into topological overlap matrix to minimize noise and spurious associations
+TOM = TOMsimilarity(adjacency)
+dissTOM = 1-TOM
+
+# use hierarchical clustering to produce a dendrogram of genes
+# call the hierarchical clustering function
+geneTree = hclust(as.dist(dissTOM), method = "average")
+
+# plot the resulting dendrogram
+sizeGrWindow(12, 9)
+plot(geneTree, xlab = "", sub = "", main = "Gene Clustering on TOM-Based Dissimilarity", labels = FALSE, hang = 0.04)
+
+# define the minimum module size (30 is relatively high)
+minModuleSize = 20
+# identify modules using dynamic tree cut
+dynamicMods = cutreeDynamic(dendro = geneTree, distM = dissTOM,
+                            deepSplit = 2, pamRespectsDendro = FALSE,
+                            minClusterSize = minModuleSize)
+table(dynamicMods)
+
+# convert numeric labels into colors
+dynamicColors = labels2colors(dynamicMods)
+table(dynamicColors)
+
+# save workspace
+# save.image(file.path(WGCNA_dir, "WGCNA Workspace.Rdata"))
+```
+
+Plot dendrogram with colors.
+
+```{r plot-dendrogram}
+pdf(file.path(WGCNA_dir, "Gene Dendrogram and Module Colors.pdf"), width = 10, height = 8)
+
+plotDendroAndColors(geneTree, dynamicColors, "Dynamic Tree Cut",
+                    dendroLabels = FALSE, hang = 0.03, 
+                    addGuide = TRUE, guideHang = 0.05,
+                     main = "Gene Dendrogram and Module Colors")
+dev.off()
+```
+
+Merge modules with similar expression profiles.
+
+```{r merge-modules}
+# calculate eigengenes
+MEList = moduleEigengenes(WGCNAgenes, colors = dynamicColors)
+MEs = MEList$eigengenes
+
+# calculate dissimilarity of module eigengenes
+MEDiss = 1-cor(MEs)
+
+# cluster module eigengenes
+METree = hclust(as.dist(MEDiss), method = "average")
+
+# choose a cut height threshold
+MEdissthresh = 0.3
+
+# plot the result
+pdf(file.path(WGCNA_dir, "Consensus Clustering of Module Eigengenes.pdf"), width = 16, height = 6)
+plot(METree, main = "Consensus Clustering of Module Eigengenes", xlab = "", sub = "")
+# plot the cut line into the dendrogram
+abline(h = MEdissthresh, col = "red")
+dev.off()
+
+# call an automatic merging function
+merge = mergeCloseModules(WGCNAgenes, dynamicColors, cutHeight = MEdissthresh, verbose = 3)
+
+# retrieve the merged module colors
+mergedColors = merge$colors
+
+# retrieve the eigengenes of the new merged modules
+mergedMEs = merge$newMEs
+
+# plot the new merged dendrogram
+pdf(file.path(WGCNA_dir, "Merged Gene Dendrogram.pdf"), width = 10, height = 8)
+plotDendroAndColors(geneTree, cbind(dynamicColors, mergedColors), 
+                    c("Dynamic Tree Cut", "Merged Dynamic"),
+                    dendroLabels = FALSE, hang = 0.03, 
+                    addGuide = TRUE, guideHang = 0.05,
+                    main = "Merged Gene Dendrogram")
+dev.off()
+
+# rename merged colors to module colors
+moduleColors = mergedColors
+MEs = mergedMEs
+
+# # construct numerical labels corresponding to the colors
+# colorOrder = c("grey", unique(moduleColors))
+# colorOrder = colorOrder[order(colorOrder)]
+# moduleLabels = match(moduleColors, colorOrder) - 1
+```
+
+# Save Output
+
+Write output to file.
+
+```{r write-output}
+# create final output
+finalOutput = cbind(moduleColors, t(WGCNAgenes))
+finalOutput = as.data.table(finalOutput, keep.rownames = "GeneID") %>%
+  merge(as.data.table(genes), ., by = "GeneID", sort = F) %>%
+  setnames(c("Name", "moduleColors"), c("Gene", "Module")) %>% # "Gene.ID", "ID", 
+  .[, Size := .N, by = "Module"] %>%
+  setcolorder(c("Module", "Size", "Gene")) %>%
+  .[order(Module)]
+
+# write WGCNA output to external file
+fwrite(finalOutput, file.path(WGCNA_dir, "WGCNA Results.csv"))
+# write_excel(finalOutput, file.path(WGCNA_dir, "WGCNA Results.xlsx"), sheet = "WGCNA Results", overwrite = T)
+
+# write excel file
+wb = createWorkbook()
+sname = "WGCNA Results"
+brainstorm::add_worksheet(wb, sheet = sname, table = finalOutput)
+setColWidths(wb, sname, cols = 1:50, widths = "auto")
+setColWidths(wb, sname, cols = 9, widths = 60)
+freezePane(wb, sname, firstRow = TRUE, firstCol = TRUE)
+
+even_idx = as.integer(as.factor(finalOutput$Module)) %% 2 == 0
+even_idx[is.na(even_idx)] = FALSE
+addStyle(wb, sname, createStyle(fontColour = "#363635", fgFill = "#FFFFFF", fontName = "Arial", fontSize = 10, border = "TopBottomLeftRight", borderStyle = "thin"), rows = which(even_idx) + 1, cols = 1:50, gridExpand = T)
+addStyle(wb, sname, createStyle(fontColour = "#363635", fgFill = "#F6F4F4", fontName = "Arial", fontSize = 10, border = "TopBottomLeftRight",  borderStyle = "thin"), rows = which(!even_idx) + 1, cols = 1:50, gridExpand = T)
+
+for(module in unique(finalOutput$Module)) {
+  
+  module_indices = which(finalOutput$Module == module) + 1
+  
+  addStyle(wb, sname, createStyle(fontColour = "#363635", fgFill = module, fontName = "Arial", fontSize = 10, textDecoration = "bold"), rows = module_indices, cols = 1, gridExpand = T)
+  
+  addStyle(wb, sname, createStyle(borderStyle = "thick", border = "top"), rows = module_indices[1], cols = 1:50, gridExpand = T, stack = T)
+  addStyle(wb, sname, createStyle(borderStyle = "thick", border = "bottom"), rows = tail(module_indices, 1), cols = 1:50, gridExpand = T, stack = T)
+}
+
+# save to Excel file
+saveWorkbook(wb, file = file.path(WGCNA_dir, "WGCNA Results.xlsx"), overwrite = T)
+```
+
+Visualize output.
+
+```{r visualize-output}
+# use the topological overlap matrix calculated during module detection
+# transform with a power to make moderately strong connections more visible in the heatmap
+plotTOM = dissTOM^6
+# set diagonal to NA for a nicer plot
+diag(plotTOM) = NA
+
+pdf(file.path(WGCNA_dir, "Network Heatmap Plot.pdf"), width = 6, height = 6)
+TOMplot(plotTOM, geneTree, moduleColors, main = "Network Heatmap Plot")
+dev.off()
+
+# png(file.path(WGCNA_dir, "Network Heatmap Plot.png"), width = 6, height = 6)
+# TOMplot(plotTOM, geneTree, moduleColors, main = "Network Heatmap Plot")
+# dev.off()
+      
+pdf(file.path(WGCNA_dir, "Eigengene Dendrogram and Adjacency Heatmap.pdf"), width = 8, height = 10)
+plotEigengeneNetworks(orderMEs(MEs), "", marDendro = c(0,4,1,2), marHeatmap = c(3,4,1,2), cex.lab = 0.8, xLabelsAngle = 90)
+dev.off()
+```
+
+# Correlate with External Trait
+
+Following tutorial [here](https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/Rpackages/WGCNA/Tutorials/FemaleLiver-03-relateModsToExt.pdf). See also discussion [here](https://support.bioconductor.org/p/111449/) regarding module-trait correlation and network sign.
+
+First, recalculate module eigengenes with color labels.
+
+```{r cor-MEs}
+# define numbers of genes and samples
+nGenes = ncol(WGCNAgenes)
+nSamples = nrow(WGCNAgenes)
+
+# recalculate module eigengenes (in this case, same as old)
+new_MEs0 = moduleEigengenes(WGCNAgenes, moduleColors)$eigengenes
+new_MEs = orderMEs(new_MEs0)
+```
+
+Save module eigengenes to file.
+
+```{r save-MEs}
+fwrite(new_MEs, file.path(WGCNA_dir, "Module Eigengenes.csv"), row.names = TRUE)
+```
+
+Next, define the correlation variables.
+
+```{r define-cor}
+# define correlation variables
+# check is TRUE: all(rownames(smap) == rownames(new_MEs))
+# datTraits = model.matrix(~0 + Treatment + Sex + Treatment:Sex, data = smap[, c("Treatment", "Sex")])
+# colnames(datTraits) = gsub("(Treatment)|(Sex)", "", colnames(datTraits))
+
+# read in GFAP data
+GFAP_levels = fread(here("Data", "GFAP_levels", "GFAPoe_GFAP_ctx_area_fraction_ranking.csv"))
+
+# define correlation variables
+datTraits = smap[, c("Sample", "Treatment", "Sex")] %>%
+  as.data.table() %>%
+  merge(GFAP_levels[, .(mouse_id2, GFAP_af)], by.x = "Sample", by.y = "mouse_id2",
+        all.x = T, all.y = F, sort = F) %>%
+  merge(GFAP_levels[, .(mouse_id2, GFAP_wb)], by.x = "Sample", by.y = "mouse_id2",
+        all.x = T, all.y = F, sort = F) %>%
+  .[, Sex := factor(Sex, levels = c("M", "F"), labels = c(0, 1))]
+  # .[, GFAP_factor := factor(Treatment, levels = c("PBS", "GFP", "WT", "R239H"),
+  #                              labels = c(0, 1, 2, 3)), ]
+
+# save rownames
+datTraits_names = datTraits$Sample
+
+# drop variables and coerce to numeric
+datTraits = datTraits %>%
+  .[, c("Sample", "Treatment") := NULL] %>%
+  map_dfc(., ~as.numeric(as.character(.x)))
+
+# add names
+datTraits = data.frame(datTraits, row.names = datTraits_names)
+
+# get trait correlation
+moduleTraitCor = WGCNA::cor(new_MEs, datTraits, use = "p", method = "spearman")
+moduleTraitPvalue = corPvalueStudent(moduleTraitCor, nSamples)
+```
+
+Compute gene module membership score.
+
+```{r module-membership}
+# compute module membership
+geneModuleMembership = as.data.frame(WGCNA::cor(WGCNAgenes, new_MEs, use = "p"))
+colnames(geneModuleMembership) = gsub("ME", "", names(new_MEs), fixed = T)
+# MMPvalue = as.data.frame(corPvalueStudent(as.matrix(geneModuleMembership), nSamples))
+
+# merge with gene names
+geneModuleMembership[["GeneID"]] = rownames(geneModuleMembership)
+geneModuleMembership = geneModuleMembership %>%
+  as.data.table() %>%
+  merge(finalOutput, ., by = "GeneID")
+
+# save to file
+fwrite(geneModuleMembership, file.path(WGCNA_dir, "Gene Module Membership.csv"))
+```
+
+Make heatmap plot.
+
+```{r cor-heatmap}
+# display correlations and their p-values
+moduleTraitCor = moduleTraitCor[, 2:1]
+moduleTraitPvalue = moduleTraitPvalue[, 2:1]
+textMatrix = paste(signif(moduleTraitCor, 2), "\n(p = ",
+                   signif(moduleTraitPvalue, 2), ")", sep = "")
+dim(textMatrix) = dim(moduleTraitCor)
+
+# get new names
+ME_names = gsub("ME", "", names(new_MEs), fixed = T)
+trait_names = c("GFAP", "Sex")
+# trait_names = c("Sex", "GFAP AF", "GFAP WB") # colnames(datTraits)
+
+# display the correlation values within a heatmap plot
+pdf(file.path(WGCNA_dir, "Module-Trait Relationships.pdf"), width = 6, height = 10)
+par(mar = c(4, 9, 2, 1)) # bottom, left, top, right
+labeledHeatmap(Matrix = moduleTraitCor,
+               verticalSeparator.x = 1,
+               # verticalSeparator.x = NULL,
+               horizontalSeparator.y = 1:nrow(moduleTraitCor),
+               # horizontalSeparator.col = ME_names,
+               xLabels = trait_names,
+               yLabels = names(new_MEs),
+               ySymbols = ME_names,
+               yColorLabels = TRUE,
+               colors = blueWhiteRed(50),
+               textMatrix = textMatrix,
+               setStdMargins = FALSE,
+               cex.text = 0.5,
+               zlim = c(-1, 1),
+               xLabelsAngle = 0,
+               xLabelsPosition = "bottom",
+               xLabelsAdj = 0.5,
+               verticalSeparator.ext = 0,
+               horizontalSeparator.lwd = 0.5,
+               main = paste("Module-Trait Relationships"))
+dev.off()
+
+# get modules with any significance
+significant_modules = apply(moduleTraitPvalue < 0.05, 1, any) %>%
+  which() %>%
+  names()
+
+# save as .RDS object
+saveRDS(significant_modules, file.path(WGCNA_dir, "Significant Module Names.RDS"))
+```
+
+Save workspace.
+
+```{r save-workspace}
+# save.image(file.path(WGCNA_dir, "WGCNA_workspace.Rdata"))
+```

@@ -1,0 +1,314 @@
+---
+title: "WGCNA Heatmaps"
+description: |
+  This R script creates heatmap visualizations of gene expression patterns from WGCNA analysis, focusing on modules that show significant correlations with sex. It processes normalized gene expression data, performs differential expression analysis, and generates detailed heatmaps showing the top genes from significant modules with their expression patterns across different treatment groups and sexes.
+author:
+  - first_name: "Ayush"
+    last_name: "Noori"
+    url: https://www.github.com/ayushnoori
+    affiliation: Massachusetts General Hospital
+    affiliation_url: https://www.serranopozolab.org
+    orcid_id: 0000-0003-1420-1236
+output:
+  distill::distill_article:
+    toc: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+# Dependencies
+
+Load requisite packages and define directories. Note that this script may also use my personal utilities package `brainstorm`, which can be downloaded via `devtools::install_github("ayushnoori/brainstorm")`.
+
+```{r load-packages, message=FALSE, warning=FALSE}
+# data manipulation
+library(data.table)
+library(purrr)
+library(magrittr)
+
+# relative file paths
+library(here)
+
+# load expression analysis packages
+library(edgeR)
+library(limma)
+
+# load mouse annotations
+library(org.Mm.eg.db)
+
+# data visualization
+library(ggplot2)
+library(EnhancedVolcano)
+library(pheatmap)
+
+# utilities package
+library(openxlsx)
+library(brainstorm)
+```
+
+Note that directories are relative to the R project path.
+
+```{r define-directores}
+# set directories
+TPM_dir = here("Data", "RNA_seq", "counts_TPM")
+sex_adj_dir = here("Data", "RNA_seq", "sex_adjusted")
+results_dir = here("Results", "RNA_seq")
+```
+
+# Read Raw Counts
+
+Read raw counts and construct expression list object.
+
+```{r read-TPM}
+# read TPM
+# TPM = fread(here(TPM_dir, "counts_tpm_filtered_low_expressed_genes.csv"))
+
+# read counts
+counts = fread(here(TPM_dir, "gene_rawcounts.csv"))
+
+# filter out low-expressed genes
+# remove genes with raw counts less than 1 in more than 3 samples
+# keep = rowSums(counts < 1) <= 3
+
+# filter out transcripts and get genes
+counts = counts[!grepl("ENSMUST", Name), ]
+genes = counts$Name
+counts = counts[, Name := NULL] %>%
+  as.data.frame()
+rownames(counts) = genes
+
+# # map genes to IDs
+# genes_str = gsub("\\.\\d+$", "", genes)
+# gene_annot = select(org.Mm.eg.db, genes_str, c("SYMBOL", "GENENAME", "GENETYPE", "ENTREZID"), "ENSEMBL") %>%
+#   as.data.table() %>%
+#   .[!duplicated(ENSEMBL), ]
+
+# read annotations
+mouse_annot = fread(here(TPM_dir, "GRCm39_mouse_genes.csv"))
+colnames(mouse_annot) = c("GeneID", "GeneIDVersion", "EntrezID", "Name", "Type", "Description", "Start", "End", "Symbol")
+genes_str = gsub("\\.\\d+$", "", rownames(counts)) %>% data.table(GeneID = .)
+genes_annot = merge(genes_str, mouse_annot, by = "GeneID", all.x = T, all.y = F, sort = F) %>%
+  .[!duplicated(GeneID)] %>%
+  .[, Symbol := NULL]
+
+# adjust rownames
+# all(genes_str$GeneID == genes_annot$GeneID)
+# sum(duplicated(genes_str$GeneID))
+rownames(counts) = genes_str$GeneID
+
+# read sample list
+sample_list = fread(here(TPM_dir, "GFAPoverexpression_RNA-seq_samples_list.csv"))[1:40]
+
+# create sample matrix
+samples = data.table(File = colnames(counts))
+sample_split = map(samples, ~strsplit(.x, "_"))[[1]] %>%
+  lapply(function(x) as.list(x[4])) %>%
+  data.table::rbindlist()
+
+# bind to samples
+samples = cbind(samples, sample_split)
+setnames(samples, c("V1"), c("Sample"))
+
+# remove non-transgenic sample
+counts = counts[, -which(samples$Sample == "NTG")]
+samples = samples[!Sample == "NTG"]
+colnames(counts) = samples$Sample
+
+# add additional columns
+samples = merge(samples, sample_list, by = "Sample", sort = F) %>%
+  .[, Number := map2(Treatment, Sample, ~gsub(.x, "", .y))] %>%
+  .[, Number := as.numeric(Number)] %>%
+  .[, Treatment := factor(Treatment, levels = c("PBS", "GFP", "WT", "R239H"))] %>%
+  .[, Sex := factor(Sex, levels = c("M", "F"))]
+
+# reorder samples
+counts = counts[, order(samples$Treatment, samples$Number)]
+samples = samples[order(Treatment, Number)]
+
+# create expression list object
+dge = DGEList(counts = counts, samples = samples, group = samples$Treatment, genes = genes_annot)
+```
+
+# Normalize Data
+
+Normalize data following [this tutorial](https://www.reneshbedre.com/blog/edger-tutorial.html).
+
+The normalization factors are an indicator of the status of gene expression. If the normalization factor is < 1 for some samples, it indicates a small number of high count genes are abundant in that sample and vice versa. The product of all normalization factors is equal to 1.
+
+Note that `calcNormFactors` doesn't normalize the data; rather, it just calculates normalization factors for use downstream.
+
+```{r norm-data}
+# make design matrix
+design = model.matrix(~0 + Treatment + Sex, data = samples)
+colnames(design) = gsub("(Treatment)|(Sex)", "", colnames(design))
+
+# filter out low-expressed genes
+keep = filterByExpr(y = dge, min.count = 5)
+message("Removing ", sum(!keep), " low-expressed genes, ", sum(keep), " genes remain.")
+dge = dge[keep, , keep.lib.sizes=FALSE]
+
+# calculate normalization factors
+dge = calcNormFactors(object = dge)
+
+# transform counts to logCPM values
+# check concordance with v$E
+# logCPM = cpm(dge, log = TRUE, prior.count = 3)
+
+# transform counts to logCPM values
+v = voom(dge, design, plot = TRUE)
+
+# # save results to file
+# saveRDS(dge, file = here(results_dir, "RNAseq_DGE.RDS"))
+# saveRDS(v, file = here(results_dir, "RNAseq_voom.RDS"))
+```
+
+
+# Differential Expression Analysis
+
+Perform differential expression analysis following Ch. 15 [here](https://www.bioconductor.org/packages/devel/bioc/vignettes/limma/inst/doc/usersguide.pdf).
+
+```{r get-degs}
+# fit linear model for each gene
+fit = lmFit(v, design)
+
+# get contrasts
+contrasts = makeContrasts(
+  GFP_vs_PBS = GFP - PBS,
+  WT_vs_PBS = WT - PBS,
+  R239H_vs_PBS = R239H - PBS,
+  WT_vs_GFP = WT - GFP,
+  R239H_vs_GFP = R239H - GFP,
+  R239H_vs_WT = R239H - WT,
+  levels = design
+)
+
+# compute contrasts from fit
+contrast_names = colnames(contrasts)
+names(contrast_names) = contrast_names
+cont_fit = contrasts.fit(fit, contrasts)
+
+# compute empirical Bayes statistics
+e_fit = eBayes(cont_fit)
+
+# get DEGs
+diff_expr = imap(contrast_names, ~topTable(e_fit, coef = .x, number = nrow(v)))
+```
+
+
+# Make WGCNA Gene Heatmap
+
+```{r gene-heatmap}
+# Get expression matrix
+expr_mtx = v$E %>%
+  as.data.table() %>%
+  .[, Gene := v$genes$Name]
+setcolorder(expr_mtx, c("Gene"))
+
+# Read gene module membership results
+WGCNA_dir = here("Results", "WGCNA")
+gene_mm = fread(file.path(WGCNA_dir, "Gene Module Membership.csv"))
+stata_df = fread(file.path(WGCNA_dir, "Module_eigengenes_sex_gfap_STATA.csv"))
+# finalOutput = fread(file.path(WGCNA_dir, "WGCNA Results.csv"))
+
+# Get list of significant modules
+# significant_modules = stata_df[(`gfap pvalue` < 0.05) | (`sex pvalue` < 0.05) | (`sex_gfap_pvalue` < 0.05), V1]
+# significant_modules = stata_df[(`gfap pvalue` < 0.05), V1]
+significant_modules = stata_df[(`sex pvalue` < 0.05), V1]
+module_list = gsub("ME", "", significant_modules)
+gmm_genes = data.table()
+
+for (module_name in module_list) {
+  
+  # # module_name = module_list[1]
+  # module_genes = finalOutput %>%
+  #   .[Gene != ""] %>%
+  #   .[Colors == module_name, Gene]
+  
+  module_genes = gene_mm %>%
+    .[Gene != ""] %>%
+    .[Colors == module_name, ] %>%
+    .[, .(GeneID, Gene, Colors, GMM = get(module_name))] %>%
+    .[order(GMM, decreasing=TRUE), ]
+    # setnames("GMM", module_name)
+    # View(module_genes[, .(GeneID, Gene, Labels, Colors, Size, GeneIDVersion, EntrezID, Type, get(module_name))])
+  
+  # Select top 20 genes
+  # module_genes = module_genes[1:20, ]
+  module_genes = module_genes[1:10, ]
+  gmm_genes = rbind(gmm_genes, module_genes)
+  
+}
+
+# Subset by genes of interest
+subset_mtx = expr_mtx[Gene %in% gmm_genes$Gene] %>%
+  .[!duplicated(Gene)]
+
+# Convert data to data frame
+setDF(subset_mtx)
+rownames(subset_mtx) = subset_mtx$Gene
+subset_mtx = subset_mtx[-1]
+
+# Scale data
+scale_data = function(b) { return(100*(b - min(b))/(max(b) - min(b))) }
+subset_mtx = apply(subset_mtx, 1, scale_data) %>% t()
+
+# Make row annotations
+row_annos = gmm_genes[, .(Gene, GMM, Colors)] %>%
+  setnames(c("GMM", "Colors"), c("Score", "Module"))
+setDF(row_annos)
+rownames(row_annos) = row_annos$Gene
+row_annos = row_annos[-1]
+
+# Make column annotations
+col_annos = v$targets %>%
+  .[, c("Treatment", "Sex")]
+
+# Reorder columns
+subset_mtx = subset_mtx[, order(col_annos$Treatment, col_annos$Sex)]
+col_annos = col_annos[order(col_annos$Treatment, col_annos$Sex), ]
+col_annos$Sex = factor(col_annos$Sex, levels = c("M", "F"), labels = c("Male", "Female"))
+col_gaps = cumsum(summary(col_annos$Treatment))
+
+# Reorder rows
+subset_mtx = subset_mtx[order(rownames(subset_mtx)), ]
+row_annos = row_annos[order(rownames(row_annos)), ]
+subset_mtx = subset_mtx[order(row_annos$Module, row_annos$Score), ]
+row_annos = row_annos[order(row_annos$Module, row_annos$Score), ]
+row_gaps = cumsum(summary(factor(row_annos$Module)))
+
+# Create palette
+hm_palette = ggsci::pal_gsea()(12)
+hm_palette = colorRampPalette(hm_palette)(100)
+
+# Define heatmap color palette for columns
+anno_colors = list(
+  Sex = c(Male = "#377EB8", Female = "#ce7b91"), 
+  Treatment = c(PBS = "#F5F8F8", GFP = "#BFD0D5", WT = "#688F9C", R239H = "#285E72"),
+  Module = module_list
+)
+names(anno_colors$Module) = module_list
+
+# row_anno_colors = list(
+#   Module = module_list
+# )
+
+# make heatmap
+p = pheatmap::pheatmap(
+  subset_mtx, color = hm_palette, border_color = "black",
+  breaks = seq(0, 100, length.out = length(hm_palette) + 1), 
+  cluster_rows = F, cluster_cols = F,
+  gaps_row = row_gaps, gaps_col = col_gaps,
+  annotation_row = row_annos,
+  annotation_col = col_annos, annotation_colors = anno_colors,
+  show_rownames = T, show_colnames = F, silent = T
+)
+
+# Save plot
+# file_name = "GFAP_modules_GMM_heatmap.pdf"
+# file_name = "GFAP_modules_GMM_heatmap.png"
+file_name = "sex_modules_GMM_heatmap.png"
+# ggsave(here(WGCNA_dir, "GMM_heatmaps", file_name), p, width = 12, height = 7, limitsize = F) # , dpi = 600
+ggsave(here(WGCNA_dir, "GMM_heatmaps", file_name), p, width = 12, height = 20, limitsize = F, dpi = 600)
+```
