@@ -1,7 +1,7 @@
 ---
 title: "A Novel Protective Role of Astrocytic GFAP in Tau Proteostasis"
 description: |
-  We have unraveled a novel role of the intermediate filament glial fibrillary acidic protein (GFAP)—a classic marker of reactive astrocytes—in the clearance of pTau aggregates with potentially beneficial effects in synaptic integrity.
+  An investigation into the role of glial fibrillary acidic protein (GFAP) upregulation, a feature of reactive astrogliosis, in Alzheimer's disease .
 site: distill::distill_website
 output:
   distill::distill_article:
